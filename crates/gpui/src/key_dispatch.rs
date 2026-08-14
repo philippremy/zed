@@ -1060,6 +1060,14 @@ mod tests {
             window.blur(cx);
             assert!(window.pending_input_is_none());
         });
+        assert_eq!(
+            cx.test_window(cx.window_handle())
+                .text_input_state_changes(),
+            [
+                crate::TextInputStateChange::FocusGained,
+                crate::TextInputStateChange::FocusLost,
+            ]
+        );
     }
 
     #[crate::test]

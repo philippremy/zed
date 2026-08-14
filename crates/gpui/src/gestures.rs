@@ -148,6 +148,7 @@ struct ActiveTouch {
     last_position: Point<Pixels>,
     started_at: Instant,
     last_moved_at: Instant,
+    last_moved_timestamp: Option<Duration>,
     velocity: Point<Pixels>,
     is_panning: bool,
 }
@@ -204,6 +205,7 @@ impl TouchGestureArena {
                         last_position: event.position,
                         started_at: now,
                         last_moved_at: now,
+                        last_moved_timestamp: event.timestamp,
                         velocity: Point::default(),
                         is_panning: false,
                     });
@@ -219,14 +221,20 @@ impl TouchGestureArena {
                     return SmallVec::new();
                 };
 
-                let elapsed = now.saturating_duration_since(active_touch.last_moved_at);
+                let elapsed = touch_sample_elapsed(
+                    event.timestamp,
+                    active_touch.last_moved_timestamp,
+                    now,
+                    active_touch.last_moved_at,
+                );
                 if !elapsed.is_zero() {
                     let instantaneous_velocity =
                         (event.position - active_touch.last_position) / elapsed.as_secs_f32();
                     active_touch.velocity =
-                        active_touch.velocity * 0.25 + instantaneous_velocity * 0.75;
+                        active_touch.velocity * 0.75 + instantaneous_velocity * 0.25;
                 }
                 active_touch.last_moved_at = now;
+                active_touch.last_moved_timestamp = event.timestamp;
                 let mut touch_phase = TouchPhase::Moved;
                 let delta = if active_touch.is_panning {
                     event.position - active_touch.last_position
@@ -265,12 +273,17 @@ impl TouchGestureArena {
                 };
 
                 if active_touch.is_panning {
-                    let elapsed = now.saturating_duration_since(active_touch.last_moved_at);
+                    let elapsed = touch_sample_elapsed(
+                        event.timestamp,
+                        active_touch.last_moved_timestamp,
+                        now,
+                        active_touch.last_moved_at,
+                    );
                     let mut velocity = active_touch.velocity;
                     if !elapsed.is_zero() && elapsed <= Duration::from_millis(100) {
                         let instantaneous_velocity =
                             (event.position - active_touch.last_position) / elapsed.as_secs_f32();
-                        velocity = velocity * 0.25 + instantaneous_velocity * 0.75;
+                        velocity = velocity * 0.75 + instantaneous_velocity * 0.25;
                     }
                     if event.phase == TouchPhase::Ended
                         && elapsed <= Duration::from_millis(100)
@@ -372,6 +385,18 @@ impl TouchGestureArena {
             touch_phase,
         }))
     }
+}
+
+fn touch_sample_elapsed(
+    timestamp: Option<Duration>,
+    previous_timestamp: Option<Duration>,
+    now: Instant,
+    previous_now: Instant,
+) -> Duration {
+    timestamp
+        .zip(previous_timestamp)
+        .and_then(|(timestamp, previous_timestamp)| timestamp.checked_sub(previous_timestamp))
+        .unwrap_or_else(|| now.saturating_duration_since(previous_now))
 }
 
 /// The set of gesture kinds that participate in recognition.
@@ -873,6 +898,7 @@ mod tests {
             phase: TouchPhase::Started,
             position,
             force: None,
+            timestamp: None,
         };
         assert!(arena.handle(&started).is_empty());
 
@@ -898,6 +924,7 @@ mod tests {
             phase: TouchPhase::Started,
             position: point(px(10.), px(20.)),
             force: None,
+            timestamp: None,
         };
         arena.handle_at(&first, first_started_at);
         arena.handle_at(
@@ -914,6 +941,7 @@ mod tests {
             phase: TouchPhase::Started,
             position: point(px(12.), px(22.)),
             force: None,
+            timestamp: None,
         };
         arena.handle_at(&second, second_started_at);
         let output = arena.handle_at(
@@ -940,6 +968,7 @@ mod tests {
             phase: TouchPhase::Started,
             position: point(px(10.), px(20.)),
             force: None,
+            timestamp: None,
         };
         arena.handle_at(&started, started_at);
         let output = arena.handle_at(
@@ -965,6 +994,7 @@ mod tests {
             phase: TouchPhase::Started,
             position: point(px(10.), px(20.)),
             force: None,
+            timestamp: None,
         };
         arena.handle(&started);
 
@@ -1007,6 +1037,7 @@ mod tests {
             phase: TouchPhase::Started,
             position: point(px(10.), px(20.)),
             force: None,
+            timestamp: None,
         };
         arena.handle_at(&started, started_at);
         let moved = TouchEvent {
@@ -1053,6 +1084,40 @@ mod tests {
     }
 
     #[test]
+    fn touch_gesture_arena_uses_platform_timestamps_for_fling_velocity() {
+        let mut arena = TouchGestureArena::new(GestureTuning::default());
+        let started_at = Instant::now();
+        let started = TouchEvent {
+            id: TouchId(1),
+            phase: TouchPhase::Started,
+            position: point(px(10.), px(20.)),
+            force: None,
+            timestamp: Some(Duration::ZERO),
+        };
+        arena.handle_at(&started, started_at);
+        arena.handle_at(
+            &TouchEvent {
+                phase: TouchPhase::Moved,
+                position: point(px(10.), px(60.)),
+                timestamp: Some(Duration::from_millis(16)),
+                ..started.clone()
+            },
+            started_at + Duration::from_secs(1),
+        );
+        arena.handle_at(
+            &TouchEvent {
+                phase: TouchPhase::Ended,
+                position: point(px(10.), px(80.)),
+                timestamp: Some(Duration::from_millis(32)),
+                ..started
+            },
+            started_at + Duration::from_secs(2),
+        );
+
+        assert!(arena.has_momentum());
+    }
+
+    #[test]
     fn touch_gesture_arena_does_not_add_momentum_to_horizontal_swipe() {
         let mut arena = TouchGestureArena::new(GestureTuning::default());
         let started_at = Instant::now();
@@ -1061,6 +1126,7 @@ mod tests {
             phase: TouchPhase::Started,
             position: point(px(10.), px(20.)),
             force: None,
+            timestamp: None,
         };
         arena.handle_at(&started, started_at);
         arena.handle_at(
@@ -1091,6 +1157,7 @@ mod tests {
             phase: TouchPhase::Started,
             position: point(px(10.), px(20.)),
             force: None,
+            timestamp: None,
         };
         arena.handle(&primary);
 

@@ -5102,6 +5102,37 @@ impl Window {
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
+        if let PlatformInput::Touch(touch) = event {
+            let semantic_events = self
+                .touch_gesture_arena
+                .handle_at(&touch, cx.background_executor().now());
+            let mut result = self.dispatch_event_with_modality(
+                PlatformInput::Touch(touch),
+                Some(InputModality::Touch),
+                cx,
+            );
+            for semantic_event in semantic_events {
+                result = match semantic_event {
+                    TouchGestureOutput::PlatformInput(event) => {
+                        self.dispatch_event_with_modality(event, Some(InputModality::Touch), cx)
+                    }
+                    TouchGestureOutput::Click(event) => self.dispatch_touch_event(&event, cx),
+                };
+            }
+            return result;
+        }
+
+        self.dispatch_event_with_modality(event, None, cx)
+    }
+
+    fn dispatch_event_with_modality(
+        &mut self,
+        event: PlatformInput,
+        input_modality: Option<InputModality>,
+        cx: &mut App,
+    ) -> DispatchEventResult {
+        #[cfg(feature = "input-latency-histogram")]
+        let dispatch_time = Instant::now();
         let update_count_before = self.invalidator.update_count();
         // Track input modality for focus-visible styling and hover suppression.
         // Hover is suppressed during keyboard modality so that keyboard navigation

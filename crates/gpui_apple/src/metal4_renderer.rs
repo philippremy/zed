@@ -1,7 +1,8 @@
 //! A Metal 4 renderer, built up one primitive at a time. Covers solid-color
-//! quads, underlines, shadows, and monochrome sprites (the first primitive
-//! that samples a texture — see `draw_monochrome_sprites`) so far — see
-//! `draw()`'s doc comment for the exact, current scope.
+//! quads, underlines, shadows, monochrome sprites, and polychrome sprites
+//! (the first two primitives that sample a texture — see
+//! `draw_monochrome_sprites`) so far — see `draw()`'s doc comment for the
+//! exact, current scope.
 //!
 //! Ported from `metal_renderer.rs`'s device/layer setup (unchanged — Metal 4
 //! doesn't touch `CAMetalLayer`/drawable acquisition at all) but the
@@ -39,7 +40,7 @@
 
 use crate::metal_atlas::MetalAtlas;
 use foreign_types::{ForeignType, ForeignTypeRef};
-use gpui::{DevicePixels, MonochromeSprite, Quad, Scene, Shadow, Size, Underline};
+use gpui::{DevicePixels, MonochromeSprite, PolychromeSprite, Quad, Scene, Shadow, Size, Underline};
 use objc::{msg_send, sel, sel_impl};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -116,11 +117,12 @@ pub struct Metal4Renderer {
     underline_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     shadow_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     monochrome_sprite_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    polychrome_sprite_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
     viewport_size_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-    /// Written by `draw_monochrome_sprites` (and, later, `draw_polychrome_sprites`)
-    /// right before it's read — same one-buffer-reused-per-draw-call
-    /// approach as `viewport_size_buffer`.
+    /// Written by `draw_monochrome_sprites`/`draw_polychrome_sprites` right
+    /// before it's read — same one-buffer-reused-per-draw-call approach as
+    /// `viewport_size_buffer`.
     atlas_size_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Reallocated (and re-added to the residency set) whenever a frame
     /// needs more quads than the current capacity.
@@ -131,11 +133,19 @@ pub struct Metal4Renderer {
     shadows_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
     /// Same growth strategy as `quads_buffer`, for `gpui::MonochromeSprite`s.
     monochrome_sprites_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
+    /// Same growth strategy as `quads_buffer`, for `gpui::PolychromeSprite`s.
+    polychrome_sprites_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
     /// The most recent atlas texture added to `residency_set` by
-    /// `draw_monochrome_sprites` — re-added only when a draw call needs a
-    /// *different* texture than last time, since `MetalAtlas` allocates its
-    /// own textures outside this renderer's control and Metal 4 has no
-    /// automatic residency to fall back on if one is missed.
+    /// `draw_monochrome_sprites`/`draw_polychrome_sprites` — re-added only
+    /// when a draw call needs a *different* texture than last time, since
+    /// `MetalAtlas` allocates its own textures outside this renderer's
+    /// control and Metal 4 has no automatic residency to fall back on if
+    /// one is missed. Shared between both sprite kinds for simplicity: a
+    /// frame that alternates between monochrome and polychrome sprites
+    /// re-adds each texture more often than strictly necessary, which is
+    /// wasted work but not a correctness problem (residency-set membership
+    /// is additive — a redundant `addAllocation` of an already-resident
+    /// texture is harmless).
     resident_atlas_texture: Cell<Option<gpui::AtlasTextureId>>,
     /// Serializes frames: signalled after each commit, waited on before the
     /// next frame reuses the (sole) allocator/command buffer/quads buffer.
@@ -324,6 +334,16 @@ impl Metal4Renderer {
             residency_set.requestResidency();
         }
 
+        let polychrome_sprites_buffer = Self::new_buffer(
+            &mtl4_device,
+            mem::size_of::<PolychromeSprite>() * MAX_QUADS_PER_FRAME_INITIAL,
+        );
+        unsafe {
+            residency_set.addAllocation(polychrome_sprites_buffer.as_ref());
+            residency_set.commit();
+            residency_set.requestResidency();
+        }
+
         let atlas_size_buffer = Self::new_buffer(&mtl4_device, mem::size_of::<ViewportSize>());
         unsafe {
             residency_set.addAllocation(atlas_size_buffer.as_ref());
@@ -354,6 +374,12 @@ impl Metal4Renderer {
             "monochrome_sprite_vertex",
             "monochrome_sprite_fragment",
         );
+        let polychrome_sprite_pipeline_state = Self::compile_pipeline(
+            &compiler,
+            &library,
+            "polychrome_sprite_vertex",
+            "polychrome_sprite_fragment",
+        );
 
         Self {
             device,
@@ -370,6 +396,7 @@ impl Metal4Renderer {
             underline_pipeline_state,
             shadow_pipeline_state,
             monochrome_sprite_pipeline_state,
+            polychrome_sprite_pipeline_state,
             unit_vertices,
             viewport_size_buffer,
             atlas_size_buffer,
@@ -378,6 +405,10 @@ impl Metal4Renderer {
             shadows_buffer: RefCell::new((shadows_buffer, MAX_QUADS_PER_FRAME_INITIAL)),
             monochrome_sprites_buffer: RefCell::new((
                 monochrome_sprites_buffer,
+                MAX_QUADS_PER_FRAME_INITIAL,
+            )),
+            polychrome_sprites_buffer: RefCell::new((
+                polychrome_sprites_buffer,
                 MAX_QUADS_PER_FRAME_INITIAL,
             )),
             resident_atlas_texture: Cell::new(None),
@@ -532,9 +563,10 @@ impl Metal4Renderer {
         // nothing to do
     }
 
-    /// Renders `scene.shadows`, `scene.quads`, `scene.underlines`, and
-    /// `scene.monochrome_sprites` only — every other primitive kind is
-    /// silently skipped. This is the documented scope of the Metal 4
+    /// Renders `scene.shadows`, `scene.quads`, `scene.underlines`,
+    /// `scene.monochrome_sprites`, and `scene.polychrome_sprites` only —
+    /// every other primitive kind is silently skipped. This is the
+    /// documented scope of the Metal 4
     /// milestone so far, not a bug: see the
     /// module doc comment.
     pub fn draw(&mut self, scene: &Scene) {
@@ -546,12 +578,10 @@ impl Metal4Renderer {
             }
         };
 
-        if !scene.paths.is_empty() || !scene.polychrome_sprites.is_empty() || !scene.surfaces.is_empty()
-        {
+        if !scene.paths.is_empty() || !scene.surfaces.is_empty() {
             log::warn!(
-                "metal4: scene has primitives ({} paths, {} poly, {} surfaces) that this milestone renderer does not draw",
+                "metal4: scene has primitives ({} paths, {} surfaces) that this milestone renderer does not draw",
                 scene.paths.len(),
-                scene.polychrome_sprites.len(),
                 scene.surfaces.len(),
             );
         }
@@ -637,6 +667,9 @@ impl Metal4Renderer {
         if !scene.monochrome_sprites.is_empty() {
             self.draw_monochrome_sprites(&scene.monochrome_sprites, viewport_size_px, &encoder);
         }
+        if !scene.polychrome_sprites.is_empty() {
+            self.draw_polychrome_sprites(&scene.polychrome_sprites, viewport_size_px, &encoder);
+        }
 
         unsafe { encoder.endEncoding() };
         unsafe { self.command_buffer.endCommandBuffer() };
@@ -687,8 +720,7 @@ impl Metal4Renderer {
             bail!("metal4: invalid size for render_scene_to_image: {:?}", size);
         }
 
-        if !scene.paths.is_empty() || !scene.polychrome_sprites.is_empty() || !scene.surfaces.is_empty()
-        {
+        if !scene.paths.is_empty() || !scene.surfaces.is_empty() {
             log::warn!(
                 "metal4: scene has primitives that this milestone renderer does not draw"
             );
@@ -778,6 +810,9 @@ impl Metal4Renderer {
         }
         if !scene.monochrome_sprites.is_empty() {
             self.draw_monochrome_sprites(&scene.monochrome_sprites, size, &encoder);
+        }
+        if !scene.polychrome_sprites.is_empty() {
+            self.draw_polychrome_sprites(&scene.polychrome_sprites, size, &encoder);
         }
 
         unsafe { encoder.endEncoding() };
@@ -1124,6 +1159,116 @@ impl Metal4Renderer {
             );
         }
     }
+
+    /// Same texture-binding/residency mechanics as `draw_monochrome_sprites`
+    /// (see its doc comment — same simplification too: assumes one atlas
+    /// texture per draw call), just `PolychromeSprite`/the polychrome
+    /// pipeline and a BGRA8Unorm atlas texture instead of monochrome's
+    /// single-channel A8Unorm one. The fragment shader samples the atlas
+    /// directly as the sprite's final colour (modulated by `opacity` and a
+    /// corner-radius SDF) rather than using it as an alpha mask over a
+    /// separate tint colour — there's no `MonochromeSprite`-style `color`
+    /// field here at all.
+    fn draw_polychrome_sprites(
+        &self,
+        sprites: &[PolychromeSprite],
+        viewport_size: Size<DevicePixels>,
+        encoder: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
+    ) {
+        let texture_id = sprites[0].tile.texture_id;
+        if sprites
+            .iter()
+            .any(|sprite| sprite.tile.texture_id != texture_id)
+        {
+            log::warn!(
+                "metal4: polychrome sprites span more than one atlas texture; only {:?}'s sprites will sample the right texture",
+                texture_id
+            );
+        }
+
+        let legacy_texture = self.sprite_atlas.metal_texture(texture_id);
+        let texture: Retained<ProtocolObject<dyn MTLTexture>> =
+            unsafe { bridge_retain(legacy_texture.as_ptr() as *mut c_void) };
+
+        if self.resident_atlas_texture.get() != Some(texture_id) {
+            unsafe {
+                self.residency_set.addAllocation(texture.as_ref());
+                self.residency_set.commit();
+                self.residency_set.requestResidency();
+            }
+            self.resident_atlas_texture.set(Some(texture_id));
+        }
+
+        {
+            let mut sprites_buffer = self.polychrome_sprites_buffer.borrow_mut();
+            if sprites.len() > sprites_buffer.1 {
+                let new_capacity = sprites.len().next_power_of_two();
+                let new_buffer = Self::new_buffer(
+                    &self.mtl4_device,
+                    mem::size_of::<PolychromeSprite>() * new_capacity,
+                );
+                unsafe {
+                    self.residency_set
+                        .removeAllocation(sprites_buffer.0.as_ref());
+                    self.residency_set.addAllocation(new_buffer.as_ref());
+                    self.residency_set.commit();
+                    self.residency_set.requestResidency();
+                }
+                *sprites_buffer = (new_buffer, new_capacity);
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    sprites.as_ptr(),
+                    sprites_buffer.0.contents().as_ptr() as *mut PolychromeSprite,
+                    sprites.len(),
+                );
+            }
+        }
+        let sprites_buffer = self.polychrome_sprites_buffer.borrow();
+
+        unsafe {
+            self.viewport_size_buffer
+                .contents()
+                .cast::<ViewportSize>()
+                .as_ptr()
+                .write(ViewportSize {
+                    width: i32::from(viewport_size.width),
+                    height: i32::from(viewport_size.height),
+                });
+            self.atlas_size_buffer
+                .contents()
+                .cast::<ViewportSize>()
+                .as_ptr()
+                .write(ViewportSize {
+                    width: texture.width() as i32,
+                    height: texture.height() as i32,
+                });
+        }
+
+        unsafe {
+            self.argument_table
+                .setAddress_atIndex(self.unit_vertices.gpuAddress(), 0);
+            self.argument_table
+                .setAddress_atIndex(sprites_buffer.0.gpuAddress(), 1);
+            self.argument_table
+                .setAddress_atIndex(self.viewport_size_buffer.gpuAddress(), 2);
+            self.argument_table
+                .setAddress_atIndex(self.atlas_size_buffer.gpuAddress(), 3);
+            self.argument_table
+                .setTexture_atIndex(texture.gpuResourceID(), 4);
+            encoder.setArgumentTable_atStages(
+                &self.argument_table,
+                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+            );
+            encoder.setRenderPipelineState(&self.polychrome_sprite_pipeline_state);
+            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                MTLPrimitiveType::Triangle,
+                0,
+                6,
+                sprites.len(),
+            );
+        }
+    }
 }
 
 /// Duplicated from `metal_renderer.rs`'s private helper of the same name
@@ -1434,6 +1579,95 @@ mod tests {
         assert_pixel_matches(&image, 100, 100, cyan, "sprite center");
         assert_pixel_matches(&image, 65, 65, cyan, "sprite, near top-left corner");
         assert_pixel_matches(&image, 134, 134, cyan, "sprite, near bottom-right corner");
+
+        let black = hsla(0.0, 0.0, 0.0, 1.0);
+        assert_pixel_matches(&image, 10, 10, black, "outside the sprite, top-left");
+        assert_pixel_matches(&image, 190, 190, black, "outside the sprite, bottom-right");
+    }
+
+    /// Renders a single polychrome sprite (an image, not a glyph/icon)
+    /// through the real Metal 4 path — same texture-binding/residency
+    /// mechanics as the monochrome sprite test, but the atlas tile carries
+    /// the sprite's actual colour (BGRA8Unorm) rather than being an alpha
+    /// mask over a separately-specified tint. `AtlasKey::Image` is what
+    /// routes a tile into the polychrome atlas (`AtlasKey::texture_kind()`);
+    /// unlike the monochrome test's fake `RenderGlyphParams`, an `ImageId`
+    /// needs no fake font/glyph fields to construct.
+    #[test]
+    fn polychrome_sprites_render_at_expected_positions_and_colors() {
+        let canvas = size(200i32, 200i32);
+        let canvas_scaled = size(
+            ScaledPixels(canvas.width as f32),
+            ScaledPixels(canvas.height as f32),
+        );
+        let full_mask = gpui::ContentMask {
+            bounds: Bounds::new(Point::default(), canvas_scaled),
+        };
+
+        let mut renderer = Metal4Renderer::new_headless();
+
+        let tile_size = gpui::size(DevicePixels(32), DevicePixels(32));
+        let key = gpui::AtlasKey::Image(gpui::RenderImageParams {
+            image_id: gpui::ImageId(0),
+            frame_index: 0,
+        });
+        // BGRA8Unorm, opaque solid orange (matches AtlasTextureKind::
+        // Polychrome's pixel format — see metal_atlas.rs).
+        let orange_bgra: [u8; 4] = [0, 140, 255, 255];
+        let pixels: Vec<u8> = orange_bgra
+            .iter()
+            .copied()
+            .cycle()
+            .take((tile_size.width.0 * tile_size.height.0 * 4) as usize)
+            .collect();
+        let tile = renderer
+            .sprite_atlas()
+            .get_or_insert_with(key, &mut || {
+                Ok(Some((tile_size, std::borrow::Cow::Borrowed(pixels.as_slice()))))
+            })
+            .expect("atlas upload failed")
+            .expect("atlas upload returned no tile");
+        assert_eq!(
+            tile.texture_id.kind,
+            gpui::AtlasTextureKind::Polychrome,
+            "an AtlasKey::Image should land in the polychrome atlas"
+        );
+
+        let orange = hsla(0.09, 1.0, 0.5, 1.0);
+
+        let sprite = PolychromeSprite {
+            order: 0,
+            pad: 0,
+            grayscale: false.into(),
+            opacity: 1.0,
+            bounds: Bounds::new(
+                point(ScaledPixels(60.0), ScaledPixels(60.0)),
+                size(ScaledPixels(80.0), ScaledPixels(80.0)),
+            ),
+            content_mask: full_mask,
+            corner_radii: Corners::default(),
+            tile,
+        };
+
+        let mut scene = Scene::default();
+        scene.polychrome_sprites.push(sprite);
+
+        let image = renderer
+            .render_scene_to_image(&scene, size(canvas.width.into(), canvas.height.into()))
+            .expect("metal4 headless render failed");
+
+        let out_path = std::env::temp_dir().join("metal4_polychrome_sprite_test.png");
+        image
+            .save(&out_path)
+            .expect("failed to save metal4 polychrome sprite test PNG");
+        eprintln!(
+            "metal4 polychrome sprite test image written to {}",
+            out_path.display()
+        );
+
+        assert_pixel_matches(&image, 100, 100, orange, "sprite center");
+        assert_pixel_matches(&image, 65, 65, orange, "sprite, near top-left corner");
+        assert_pixel_matches(&image, 134, 134, orange, "sprite, near bottom-right corner");
 
         let black = hsla(0.0, 0.0, 0.0, 1.0);
         assert_pixel_matches(&image, 10, 10, black, "outside the sprite, top-left");

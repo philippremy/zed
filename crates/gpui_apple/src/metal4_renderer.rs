@@ -1,8 +1,10 @@
 //! A Metal 4 renderer, built up one primitive at a time. Covers solid-color
-//! quads, underlines, shadows, monochrome sprites, and polychrome sprites
-//! (the first two primitives that sample a texture — see
-//! `draw_monochrome_sprites`) so far — see `draw()`'s doc comment for the
-//! exact, current scope.
+//! quads, underlines, shadows, monochrome sprites, polychrome sprites (the
+//! first two primitives that sample a texture — see
+//! `draw_monochrome_sprites`), and paths (the one genuinely different shape
+//! of problem among all of these — a two-pass rasterize-then-composite
+//! pipeline, see `draw_paths_to_intermediate`) so far — see `draw()`'s doc
+//! comment for the exact, current scope.
 //!
 //! Ported from `metal_renderer.rs`'s device/layer setup (unchanged — Metal 4
 //! doesn't touch `CAMetalLayer`/drawable acquisition at all) but the
@@ -39,8 +41,12 @@
 //! `signalDrawable:` after commit, then `[drawable present]`).
 
 use crate::metal_atlas::MetalAtlas;
+use crate::metal_renderer::{PathRasterizationVertex, PathSprite};
 use foreign_types::{ForeignType, ForeignTypeRef};
-use gpui::{DevicePixels, MonochromeSprite, PolychromeSprite, Quad, Scene, Shadow, Size, Underline};
+use gpui::{
+    DevicePixels, MonochromeSprite, Path, PolychromeSprite, Quad, ScaledPixels, Scene, Shadow,
+    Size, Underline,
+};
 use objc::{msg_send, sel, sel_impl};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -77,6 +83,17 @@ unsafe fn bridge_retain_autoreleased<T: objc2::Message>(ptr: *mut c_void) -> Ret
 }
 
 const MAX_QUADS_PER_FRAME_INITIAL: usize = 256;
+/// Same reasoning as `metal_renderer.rs`'s own `PATH_SAMPLE_COUNT` (not
+/// reused directly — that constant is private to that file, and this is a
+/// one-line, zero-risk duplication rather than widening its visibility):
+/// 4x MSAA, which every device supports.
+/// https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
+const PATH_SAMPLE_COUNT: u32 = 4;
+/// Initial capacity for the flattened path-vertex buffer — each path
+/// contributes a variable number of triangles (3 vertices each), so this is
+/// sized as "a few dozen small paths' worth" rather than mirroring
+/// `MAX_QUADS_PER_FRAME_INITIAL` 1:1 the way the other instance buffers do.
+const MAX_PATH_VERTICES_INITIAL: usize = 3 * 256;
 
 /// Bit-for-bit layout of the shader's `Size_DevicePixels` (cbindgen-generated
 /// from `gpui::Size<DevicePixels>`, itself two `i32`s) — **not** `f32`. Using
@@ -118,6 +135,8 @@ pub struct Metal4Renderer {
     shadow_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     monochrome_sprite_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     polychrome_sprite_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    path_rasterization_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    path_sprite_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
     viewport_size_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Written by `draw_monochrome_sprites`/`draw_polychrome_sprites` right
@@ -135,6 +154,28 @@ pub struct Metal4Renderer {
     monochrome_sprites_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
     /// Same growth strategy as `quads_buffer`, for `gpui::PolychromeSprite`s.
     polychrome_sprites_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
+    /// Flattened `PathRasterizationVertex`es for every path in the scene —
+    /// not instanced like the other buffers (each vertex is one corner of
+    /// one triangle, drawn with a plain, non-instanced `drawPrimitives`),
+    /// so "growth" here means "more total vertices across all paths," not
+    /// "more instances."
+    path_vertices_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
+    /// One `PathSprite` (just a `Bounds`) per path, used only by the
+    /// compositing pass — see `draw_paths_from_intermediate`.
+    path_sprites_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
+    /// Full-viewport-sized, rebuilt on resize (`draw_paths_to_intermediate`
+    /// checks the size itself, lazily, only when there's a path to
+    /// rasterize — unlike `MetalRenderer`, which always keeps this current
+    /// via an explicit `update_path_intermediate_textures` call). Legacy
+    /// `metal` crate textures, like every other renderer-owned texture in
+    /// this file, bridged to objc2 only where the MTL4 APIs need it.
+    path_intermediate_texture: RefCell<Option<metal::Texture>>,
+    /// `None` when `path_sample_count <= 1` (never happens today —
+    /// `PATH_SAMPLE_COUNT` is a fixed constant — but mirrors
+    /// `MetalRenderer`'s structure in case that ever becomes configurable).
+    path_intermediate_msaa_texture: RefCell<Option<metal::Texture>>,
+    /// The `(width, height)` the two textures above were last built for.
+    path_intermediate_size: Cell<Option<(i32, i32)>>,
     /// The most recent atlas texture added to `residency_set` by
     /// `draw_monochrome_sprites`/`draw_polychrome_sprites` — re-added only
     /// when a draw call needs a *different* texture than last time, since
@@ -344,6 +385,26 @@ impl Metal4Renderer {
             residency_set.requestResidency();
         }
 
+        let path_vertices_buffer = Self::new_buffer(
+            &mtl4_device,
+            mem::size_of::<PathRasterizationVertex>() * MAX_PATH_VERTICES_INITIAL,
+        );
+        unsafe {
+            residency_set.addAllocation(path_vertices_buffer.as_ref());
+            residency_set.commit();
+            residency_set.requestResidency();
+        }
+
+        let path_sprites_buffer = Self::new_buffer(
+            &mtl4_device,
+            mem::size_of::<PathSprite>() * MAX_QUADS_PER_FRAME_INITIAL,
+        );
+        unsafe {
+            residency_set.addAllocation(path_sprites_buffer.as_ref());
+            residency_set.commit();
+            residency_set.requestResidency();
+        }
+
         let atlas_size_buffer = Self::new_buffer(&mtl4_device, mem::size_of::<ViewportSize>());
         unsafe {
             residency_set.addAllocation(atlas_size_buffer.as_ref());
@@ -380,6 +441,9 @@ impl Metal4Renderer {
             "polychrome_sprite_vertex",
             "polychrome_sprite_fragment",
         );
+        let path_rasterization_pipeline_state =
+            Self::compile_path_rasterization_pipeline(&compiler, &library);
+        let path_sprite_pipeline_state = Self::compile_path_sprite_pipeline(&compiler, &library);
 
         Self {
             device,
@@ -397,6 +461,8 @@ impl Metal4Renderer {
             shadow_pipeline_state,
             monochrome_sprite_pipeline_state,
             polychrome_sprite_pipeline_state,
+            path_rasterization_pipeline_state,
+            path_sprite_pipeline_state,
             unit_vertices,
             viewport_size_buffer,
             atlas_size_buffer,
@@ -411,6 +477,11 @@ impl Metal4Renderer {
                 polychrome_sprites_buffer,
                 MAX_QUADS_PER_FRAME_INITIAL,
             )),
+            path_vertices_buffer: RefCell::new((path_vertices_buffer, MAX_PATH_VERTICES_INITIAL)),
+            path_sprites_buffer: RefCell::new((path_sprites_buffer, MAX_QUADS_PER_FRAME_INITIAL)),
+            path_intermediate_texture: RefCell::new(None),
+            path_intermediate_msaa_texture: RefCell::new(None),
+            path_intermediate_size: Cell::new(None),
             resident_atlas_texture: Cell::new(None),
             shared_event,
             frame_number: Cell::new(0),
@@ -519,6 +590,111 @@ impl Metal4Renderer {
             .unwrap_or_else(|_| panic!("metal4: compiler could not build the {vertex_fn_name}/{fragment_fn_name} pipeline state"))
     }
 
+    /// Like `compile_pipeline`, but for `path_sprite_vertex`/`_fragment`:
+    /// premultiplied-alpha "over" blending (source factors both `One`, not
+    /// `compile_pipeline`'s `SourceAlpha`/`One`) — matches
+    /// `path_rasterization_fragment`'s premultiplied output
+    /// (`color.rgb * color.a * alpha, alpha * color.a`) and
+    /// `MetalRenderer::build_path_sprite_pipeline_state`.
+    fn compile_path_sprite_pipeline(
+        compiler: &ProtocolObject<dyn MTL4Compiler>,
+        library: &ProtocolObject<dyn objc2_metal::MTLLibrary>,
+    ) -> Retained<ProtocolObject<dyn MTLRenderPipelineState>> {
+        let vertex_function_descriptor = unsafe { MTL4LibraryFunctionDescriptor::new() };
+        unsafe {
+            vertex_function_descriptor.setLibrary(Some(library));
+            vertex_function_descriptor
+                .setName(Some(&objc2_foundation::NSString::from_str("path_sprite_vertex")));
+        }
+        let fragment_function_descriptor = unsafe { MTL4LibraryFunctionDescriptor::new() };
+        unsafe {
+            fragment_function_descriptor.setLibrary(Some(library));
+            fragment_function_descriptor.setName(Some(&objc2_foundation::NSString::from_str(
+                "path_sprite_fragment",
+            )));
+        }
+
+        let pipeline_descriptor = unsafe { MTL4RenderPipelineDescriptor::new() };
+        unsafe {
+            pipeline_descriptor.setVertexFunctionDescriptor(Some(&vertex_function_descriptor));
+            pipeline_descriptor.setFragmentFunctionDescriptor(Some(&fragment_function_descriptor));
+            let color_attachment = pipeline_descriptor.colorAttachments().objectAtIndexedSubscript(0);
+            color_attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+            color_attachment.setBlendingState(MTL4BlendState::Enabled);
+            color_attachment.setRgbBlendOperation(objc2_metal::MTLBlendOperation::Add);
+            color_attachment.setAlphaBlendOperation(objc2_metal::MTLBlendOperation::Add);
+            color_attachment.setSourceRGBBlendFactor(objc2_metal::MTLBlendFactor::One);
+            color_attachment.setSourceAlphaBlendFactor(objc2_metal::MTLBlendFactor::One);
+            color_attachment
+                .setDestinationRGBBlendFactor(objc2_metal::MTLBlendFactor::OneMinusSourceAlpha);
+            color_attachment.setDestinationAlphaBlendFactor(objc2_metal::MTLBlendFactor::One);
+        }
+
+        compiler
+            .newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(
+                &pipeline_descriptor,
+                None,
+            )
+            .expect("metal4: compiler could not build the path_sprite pipeline state")
+    }
+
+    /// Like `compile_path_sprite_pipeline`, but for
+    /// `path_rasterization_vertex`/`_fragment` — same premultiplied blend
+    /// idea, except the destination *alpha* factor is also
+    /// `OneMinusSourceAlpha` (not `One`), because unlike the sprite pass
+    /// this one can composite multiple overlapping, still-transparent path
+    /// triangles into the same intermediate pixel before it's ever sampled,
+    /// so alpha itself has to accumulate correctly too — matches
+    /// `MetalRenderer::build_path_rasterization_pipeline_state`. Also
+    /// declares the pipeline's raster sample count so it matches the MSAA
+    /// intermediate texture it renders into.
+    fn compile_path_rasterization_pipeline(
+        compiler: &ProtocolObject<dyn MTL4Compiler>,
+        library: &ProtocolObject<dyn objc2_metal::MTLLibrary>,
+    ) -> Retained<ProtocolObject<dyn MTLRenderPipelineState>> {
+        let vertex_function_descriptor = unsafe { MTL4LibraryFunctionDescriptor::new() };
+        unsafe {
+            vertex_function_descriptor.setLibrary(Some(library));
+            vertex_function_descriptor.setName(Some(&objc2_foundation::NSString::from_str(
+                "path_rasterization_vertex",
+            )));
+        }
+        let fragment_function_descriptor = unsafe { MTL4LibraryFunctionDescriptor::new() };
+        unsafe {
+            fragment_function_descriptor.setLibrary(Some(library));
+            fragment_function_descriptor.setName(Some(&objc2_foundation::NSString::from_str(
+                "path_rasterization_fragment",
+            )));
+        }
+
+        let pipeline_descriptor = unsafe { MTL4RenderPipelineDescriptor::new() };
+        unsafe {
+            pipeline_descriptor.setVertexFunctionDescriptor(Some(&vertex_function_descriptor));
+            pipeline_descriptor.setFragmentFunctionDescriptor(Some(&fragment_function_descriptor));
+            if PATH_SAMPLE_COUNT > 1 {
+                pipeline_descriptor.setRasterSampleCount(PATH_SAMPLE_COUNT as usize);
+            }
+            let color_attachment = pipeline_descriptor.colorAttachments().objectAtIndexedSubscript(0);
+            color_attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+            color_attachment.setBlendingState(MTL4BlendState::Enabled);
+            color_attachment.setRgbBlendOperation(objc2_metal::MTLBlendOperation::Add);
+            color_attachment.setAlphaBlendOperation(objc2_metal::MTLBlendOperation::Add);
+            color_attachment.setSourceRGBBlendFactor(objc2_metal::MTLBlendFactor::One);
+            color_attachment.setSourceAlphaBlendFactor(objc2_metal::MTLBlendFactor::One);
+            color_attachment
+                .setDestinationRGBBlendFactor(objc2_metal::MTLBlendFactor::OneMinusSourceAlpha);
+            color_attachment
+                .setDestinationAlphaBlendFactor(objc2_metal::MTLBlendFactor::OneMinusSourceAlpha);
+        }
+
+        compiler
+            .newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(
+                &pipeline_descriptor,
+                None,
+            )
+            .expect("metal4: compiler could not build the path_rasterization pipeline state")
+    }
+
     pub fn layer(&self) -> Option<&metal::MetalLayerRef> {
         self.layer.as_ref().map(|l| l.as_ref())
     }
@@ -563,10 +739,11 @@ impl Metal4Renderer {
         // nothing to do
     }
 
-    /// Renders `scene.shadows`, `scene.quads`, `scene.underlines`,
-    /// `scene.monochrome_sprites`, and `scene.polychrome_sprites` only —
-    /// every other primitive kind is silently skipped. This is the
-    /// documented scope of the Metal 4
+    /// Renders `scene.shadows`, `scene.paths`, `scene.quads`,
+    /// `scene.underlines`, `scene.monochrome_sprites`, and
+    /// `scene.polychrome_sprites` only — every other primitive kind (just
+    /// `scene.surfaces` now) is silently skipped. This is the documented
+    /// scope of the Metal 4
     /// milestone so far, not a bug: see the
     /// module doc comment.
     pub fn draw(&mut self, scene: &Scene) {
@@ -578,10 +755,9 @@ impl Metal4Renderer {
             }
         };
 
-        if !scene.paths.is_empty() || !scene.surfaces.is_empty() {
+        if !scene.surfaces.is_empty() {
             log::warn!(
-                "metal4: scene has primitives ({} paths, {} surfaces) that this milestone renderer does not draw",
-                scene.paths.len(),
+                "metal4: scene has {} surface primitives that this milestone renderer does not draw",
                 scene.surfaces.len(),
             );
         }
@@ -620,6 +796,13 @@ impl Metal4Renderer {
                 .beginCommandBufferWithAllocator(&self.allocator)
         };
 
+        // Its own render pass, so it has to happen before the main one
+        // below is created — Metal can't have two encoders active on one
+        // command buffer at once. See draw_paths_to_intermediate's doc
+        // comment for why paths end up composited before quads/underlines/
+        // sprites in every frame rather than at their real scene position.
+        let did_rasterize_paths = self.draw_paths_to_intermediate(&scene.paths, viewport_size_px);
+
         let texture: Retained<ProtocolObject<dyn objc2_metal::MTLTexture>> =
             unsafe { bridge_retain(drawable.texture().as_ptr() as *mut c_void) };
 
@@ -657,6 +840,9 @@ impl Metal4Renderer {
 
         if !scene.shadows.is_empty() {
             self.draw_shadows(&scene.shadows, viewport_size_px, &encoder);
+        }
+        if did_rasterize_paths {
+            self.draw_paths_from_intermediate(&scene.paths, viewport_size_px, &encoder);
         }
         if !scene.quads.is_empty() {
             self.draw_quads(&scene.quads, viewport_size_px, &encoder);
@@ -720,7 +906,7 @@ impl Metal4Renderer {
             bail!("metal4: invalid size for render_scene_to_image: {:?}", size);
         }
 
-        if !scene.paths.is_empty() || !scene.surfaces.is_empty() {
+        if !scene.surfaces.is_empty() {
             log::warn!(
                 "metal4: scene has primitives that this milestone renderer does not draw"
             );
@@ -768,6 +954,8 @@ impl Metal4Renderer {
                 .beginCommandBufferWithAllocator(&self.allocator)
         };
 
+        let did_rasterize_paths = self.draw_paths_to_intermediate(&scene.paths, size);
+
         let render_pass_descriptor = unsafe { MTL4RenderPassDescriptor::new() };
         unsafe {
             let color_attachment = render_pass_descriptor.colorAttachments().objectAtIndexedSubscript(0);
@@ -801,6 +989,9 @@ impl Metal4Renderer {
 
         if !scene.shadows.is_empty() {
             self.draw_shadows(&scene.shadows, size, &encoder);
+        }
+        if did_rasterize_paths {
+            self.draw_paths_from_intermediate(&scene.paths, size, &encoder);
         }
         if !scene.quads.is_empty() {
             self.draw_quads(&scene.quads, size, &encoder);
@@ -1269,6 +1460,309 @@ impl Metal4Renderer {
             );
         }
     }
+
+    /// Rebuilds `path_intermediate_texture`/`path_intermediate_msaa_texture`
+    /// for a new viewport size — mirrors
+    /// `MetalRenderer::update_path_intermediate_textures` exactly (down to
+    /// the memoryless-on-Apple-GPUs storage-mode choice for the MSAA
+    /// texture, since MSAA render targets are resolved within a single pass
+    /// and never need to persist past it), just called lazily from
+    /// `draw_paths_to_intermediate` — only when there's a path to
+    /// rasterize — rather than eagerly on every resize.
+    fn rebuild_path_intermediate_textures(&self, size: Size<DevicePixels>) {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            *self.path_intermediate_texture.borrow_mut() = None;
+            *self.path_intermediate_msaa_texture.borrow_mut() = None;
+            self.path_intermediate_size.set(None);
+            return;
+        }
+
+        let texture_descriptor = metal::TextureDescriptor::new();
+        texture_descriptor.set_width(size.width.0 as u64);
+        texture_descriptor.set_height(size.height.0 as u64);
+        texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        texture_descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        let new_intermediate = self.device.new_texture(&texture_descriptor);
+
+        if PATH_SAMPLE_COUNT > 1 {
+            let is_apple_gpu = self.device.supports_family(metal::MTLGPUFamily::Apple1);
+            let storage_mode = if is_apple_gpu {
+                metal::MTLStorageMode::Memoryless
+            } else {
+                metal::MTLStorageMode::Private
+            };
+            let msaa_descriptor = texture_descriptor;
+            msaa_descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
+            msaa_descriptor.set_storage_mode(storage_mode);
+            msaa_descriptor.set_sample_count(PATH_SAMPLE_COUNT as _);
+            *self.path_intermediate_msaa_texture.borrow_mut() =
+                Some(self.device.new_texture(&msaa_descriptor));
+        } else {
+            *self.path_intermediate_msaa_texture.borrow_mut() = None;
+        }
+
+        *self.path_intermediate_texture.borrow_mut() = Some(new_intermediate);
+        self.path_intermediate_size
+            .set(Some((size.width.0, size.height.0)));
+    }
+
+    /// Rasterizes every path in the scene into the shared, full-viewport-
+    /// sized intermediate texture — its own render pass, entirely separate
+    /// from the main one, since Metal (3 or 4 alike) can't switch render
+    /// targets mid-encoder. Called *before* the main encoder for the frame
+    /// exists, if there's anything to rasterize;
+    /// `draw_paths_from_intermediate` (called *during* the main encoder)
+    /// composites the result in afterwards. This is why paths end up drawn
+    /// before quads/underlines/sprites in every frame rather than
+    /// interleaved at each path's real position in the scene, the way
+    /// `MetalRenderer::draw()`'s per-batch `PrimitiveBatch` dispatch does —
+    /// the same "fixed draw order, not scene z-order between primitive
+    /// *types*" simplification already true of every other primitive this
+    /// renderer handles (see the module doc comment).
+    ///
+    /// Returns whether anything was actually rasterized — mirrors
+    /// `MetalRenderer::draw_paths_to_intermediate`'s `did_draw` bool, so the
+    /// caller knows whether it's safe to skip the composite pass entirely.
+    fn draw_paths_to_intermediate(
+        &self,
+        paths: &[Path<ScaledPixels>],
+        viewport_size: Size<DevicePixels>,
+    ) -> bool {
+        if paths.is_empty() {
+            return false;
+        }
+
+        if self.path_intermediate_size.get()
+            != Some((viewport_size.width.0, viewport_size.height.0))
+        {
+            self.rebuild_path_intermediate_textures(viewport_size);
+        }
+
+        let intermediate_texture_ref = self.path_intermediate_texture.borrow();
+        let Some(intermediate_texture) = intermediate_texture_ref.as_ref() else {
+            return false;
+        };
+
+        let mut vertices = Vec::new();
+        for path in paths {
+            vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
+                xy_position: v.xy_position,
+                st_position: v.st_position,
+                color: path.color,
+                bounds: path.bounds.intersect(&path.content_mask.bounds),
+            }));
+        }
+        if vertices.is_empty() {
+            return false;
+        }
+
+        {
+            let mut path_vertices_buffer = self.path_vertices_buffer.borrow_mut();
+            if vertices.len() > path_vertices_buffer.1 {
+                let new_capacity = vertices.len().next_power_of_two();
+                let new_buffer = Self::new_buffer(
+                    &self.mtl4_device,
+                    mem::size_of::<PathRasterizationVertex>() * new_capacity,
+                );
+                unsafe {
+                    self.residency_set
+                        .removeAllocation(path_vertices_buffer.0.as_ref());
+                    self.residency_set.addAllocation(new_buffer.as_ref());
+                    self.residency_set.commit();
+                    self.residency_set.requestResidency();
+                }
+                *path_vertices_buffer = (new_buffer, new_capacity);
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    vertices.as_ptr(),
+                    path_vertices_buffer.0.contents().as_ptr() as *mut PathRasterizationVertex,
+                    vertices.len(),
+                );
+            }
+        }
+        let path_vertices_buffer = self.path_vertices_buffer.borrow();
+
+        unsafe {
+            self.viewport_size_buffer
+                .contents()
+                .cast::<ViewportSize>()
+                .as_ptr()
+                .write(ViewportSize {
+                    width: i32::from(viewport_size.width),
+                    height: i32::from(viewport_size.height),
+                });
+        }
+
+        let msaa_texture_ref = self.path_intermediate_msaa_texture.borrow();
+        let render_pass_descriptor = unsafe { MTL4RenderPassDescriptor::new() };
+        unsafe {
+            let color_attachment =
+                render_pass_descriptor.colorAttachments().objectAtIndexedSubscript(0);
+            color_attachment.setLoadAction(MTLLoadAction::Clear);
+            color_attachment.setClearColor(MTLClearColor {
+                red: 0.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: 0.0,
+            });
+
+            let resolve_texture: Retained<ProtocolObject<dyn MTLTexture>> =
+                bridge_retain(intermediate_texture.as_ptr() as *mut c_void);
+            if let Some(msaa_texture) = msaa_texture_ref.as_ref() {
+                let msaa_bridged: Retained<ProtocolObject<dyn MTLTexture>> =
+                    bridge_retain(msaa_texture.as_ptr() as *mut c_void);
+                color_attachment.setTexture(Some(&msaa_bridged));
+                color_attachment.setResolveTexture(Some(&resolve_texture));
+                color_attachment.setStoreAction(MTLStoreAction::MultisampleResolve);
+            } else {
+                color_attachment.setTexture(Some(&resolve_texture));
+                color_attachment.setStoreAction(MTLStoreAction::Store);
+            }
+        }
+
+        let encoder = unsafe {
+            self.command_buffer
+                .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
+        }
+        .expect("metal4: failed to create a render command encoder for path rasterization");
+
+        unsafe {
+            self.argument_table
+                .setAddress_atIndex(path_vertices_buffer.0.gpuAddress(), 0);
+            self.argument_table
+                .setAddress_atIndex(self.viewport_size_buffer.gpuAddress(), 1);
+            encoder.setArgumentTable_atStages(
+                &self.argument_table,
+                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+            );
+            encoder.setRenderPipelineState(&self.path_rasterization_pipeline_state);
+            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                MTLPrimitiveType::Triangle,
+                0,
+                vertices.len(),
+                1,
+            );
+            encoder.endEncoding();
+        }
+
+        true
+    }
+
+    /// Composites the shared intermediate texture — already fully
+    /// rasterized by `draw_paths_to_intermediate`, called earlier in the
+    /// same frame before the main encoder existed — into the main render
+    /// target, one `PathSprite` quad per path. Called *during* the main
+    /// encoder, alongside the other `draw_*` methods.
+    ///
+    /// Simplification not present in `MetalRenderer`: always emits one
+    /// sprite per path, rather than reasoning about draw order to sometimes
+    /// merge several into a single spanning-rect copy (see
+    /// `MetalRenderer::draw_paths_from_intermediate`'s comment on why it
+    /// does that — "each pixel must only be copied once, in case of
+    /// transparent paths"). Two *different-order* paths whose bounds
+    /// overlap would get composited, and blended against the destination,
+    /// once each here, which can double-blend the overlap region — a real,
+    /// known gap, acceptable for now because it only matters for
+    /// overlapping paths, and every primitive this renderer draws already
+    /// ignores real scene z-order between *types* anyway (see the module
+    /// doc comment).
+    fn draw_paths_from_intermediate(
+        &self,
+        paths: &[Path<ScaledPixels>],
+        viewport_size: Size<DevicePixels>,
+        encoder: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        let intermediate_texture_ref = self.path_intermediate_texture.borrow();
+        let Some(intermediate_texture) = intermediate_texture_ref.as_ref() else {
+            log::error!("metal4: no path intermediate texture to composite from");
+            return;
+        };
+        let texture: Retained<ProtocolObject<dyn MTLTexture>> =
+            unsafe { bridge_retain(intermediate_texture.as_ptr() as *mut c_void) };
+
+        // Unconditional, unlike the atlas-texture caching in
+        // draw_monochrome_sprites/draw_polychrome_sprites: paths are
+        // composited at most once per frame, so there's no repeated-call
+        // thrashing to avoid here.
+        unsafe {
+            self.residency_set.addAllocation(texture.as_ref());
+            self.residency_set.commit();
+            self.residency_set.requestResidency();
+        }
+
+        let sprites: Vec<PathSprite> = paths
+            .iter()
+            .map(|path| PathSprite {
+                bounds: path.clipped_bounds(),
+            })
+            .collect();
+
+        {
+            let mut path_sprites_buffer = self.path_sprites_buffer.borrow_mut();
+            if sprites.len() > path_sprites_buffer.1 {
+                let new_capacity = sprites.len().next_power_of_two();
+                let new_buffer = Self::new_buffer(
+                    &self.mtl4_device,
+                    mem::size_of::<PathSprite>() * new_capacity,
+                );
+                unsafe {
+                    self.residency_set
+                        .removeAllocation(path_sprites_buffer.0.as_ref());
+                    self.residency_set.addAllocation(new_buffer.as_ref());
+                    self.residency_set.commit();
+                    self.residency_set.requestResidency();
+                }
+                *path_sprites_buffer = (new_buffer, new_capacity);
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    sprites.as_ptr(),
+                    path_sprites_buffer.0.contents().as_ptr() as *mut PathSprite,
+                    sprites.len(),
+                );
+            }
+        }
+        let path_sprites_buffer = self.path_sprites_buffer.borrow();
+
+        unsafe {
+            self.viewport_size_buffer
+                .contents()
+                .cast::<ViewportSize>()
+                .as_ptr()
+                .write(ViewportSize {
+                    width: i32::from(viewport_size.width),
+                    height: i32::from(viewport_size.height),
+                });
+        }
+
+        unsafe {
+            self.argument_table
+                .setAddress_atIndex(self.unit_vertices.gpuAddress(), 0);
+            self.argument_table
+                .setAddress_atIndex(path_sprites_buffer.0.gpuAddress(), 1);
+            self.argument_table
+                .setAddress_atIndex(self.viewport_size_buffer.gpuAddress(), 2);
+            self.argument_table
+                .setTexture_atIndex(texture.gpuResourceID(), 4);
+            encoder.setArgumentTable_atStages(
+                &self.argument_table,
+                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+            );
+            encoder.setRenderPipelineState(&self.path_sprite_pipeline_state);
+            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                MTLPrimitiveType::Triangle,
+                0,
+                6,
+                sprites.len(),
+            );
+        }
+    }
 }
 
 /// Duplicated from `metal_renderer.rs`'s private helper of the same name
@@ -1672,6 +2166,67 @@ mod tests {
         let black = hsla(0.0, 0.0, 0.0, 1.0);
         assert_pixel_matches(&image, 10, 10, black, "outside the sprite, top-left");
         assert_pixel_matches(&image, 190, 190, black, "outside the sprite, bottom-right");
+    }
+
+    /// Renders a single solid-filled triangle path through the real Metal 4
+    /// path — the two-pass rasterize-then-composite architecture, the one
+    /// genuinely different shape of problem among the primitives this
+    /// renderer handles (everything else is a single pass). Built with
+    /// `gpui::Path`'s own public `line_to` API (the same one gpui's own
+    /// drawing code uses), not by hand-constructing vertex data, so this
+    /// also exercises the real straight-line triangulation path (each
+    /// straight edge contributes `st=(0,1)` uniformly, which
+    /// `path_rasterization_fragment`'s near-zero-derivative branch turns
+    /// into flat, fully-opaque fill with no curve antialiasing math — a
+    /// deliberately simple case to pixel-test precisely, same reasoning as
+    /// the shadow test's `blur_radius: 0`).
+    #[test]
+    fn paths_render_at_expected_positions_and_colors() {
+        let canvas = size(200i32, 200i32);
+        let canvas_scaled = size(
+            ScaledPixels(canvas.width as f32),
+            ScaledPixels(canvas.height as f32),
+        );
+
+        let magenta = hsla(0.83, 1.0, 0.5, 1.0);
+
+        let mut path = gpui::Path::new(gpui::point(gpui::px(40.0), gpui::px(40.0)));
+        path.line_to(gpui::point(gpui::px(160.0), gpui::px(40.0)));
+        path.line_to(gpui::point(gpui::px(100.0), gpui::px(160.0)));
+        path.color = magenta.into();
+        path.content_mask = gpui::ContentMask {
+            bounds: Bounds::new(
+                Point::default(),
+                size(gpui::px(canvas.width as f32), gpui::px(canvas.height as f32)),
+            ),
+        };
+        let path = path.scale(1.0);
+        assert_eq!(
+            path.content_mask.bounds.size, canvas_scaled,
+            "sanity check: scale(1.0) should leave the full-canvas content mask numerically unchanged"
+        );
+
+        let mut scene = Scene::default();
+        scene.paths.push(path);
+
+        let mut renderer = Metal4Renderer::new_headless();
+        let image = renderer
+            .render_scene_to_image(&scene, size(canvas.width.into(), canvas.height.into()))
+            .expect("metal4 headless render failed");
+
+        let out_path = std::env::temp_dir().join("metal4_path_test.png");
+        image
+            .save(&out_path)
+            .expect("failed to save metal4 path test PNG");
+        eprintln!("metal4 path test image written to {}", out_path.display());
+
+        // Well inside the triangle (40,40)-(160,40)-(100,160): near its centroid.
+        assert_pixel_matches(&image, 100, 100, magenta, "triangle interior");
+
+        let black = hsla(0.0, 0.0, 0.0, 1.0);
+        assert_pixel_matches(&image, 10, 10, black, "outside the triangle, top-left corner");
+        assert_pixel_matches(&image, 190, 190, black, "outside the triangle, bottom-right corner");
+        assert_pixel_matches(&image, 100, 190, black, "below the triangle's apex");
     }
 }
 

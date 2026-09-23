@@ -5,6 +5,7 @@
 //! by GPUI's Apple platform backends.
 
 mod metal4_capability;
+mod metal4_renderer;
 mod metal_atlas;
 pub mod metal_renderer;
 pub mod renderer_select;

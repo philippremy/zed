@@ -69,10 +69,16 @@ unsafe fn bridge_retain_autoreleased<T: objc2::Message>(ptr: *mut c_void) -> Ret
 
 const MAX_QUADS_PER_FRAME_INITIAL: usize = 256;
 
+/// Bit-for-bit layout of the shader's `Size_DevicePixels` (cbindgen-generated
+/// from `gpui::Size<DevicePixels>`, itself two `i32`s) — **not** `f32`. Using
+/// the wrong field type here was an actual bug caught by the headless quad
+/// test: reinterpreting a viewport-size `f32` bit pattern as `int32_t`
+/// produces a garbage viewport size, which pushes every quad's clip-space
+/// position outside the -1..1 range — i.e. a fully black frame.
 #[repr(C)]
 struct ViewportSize {
-    width: f32,
-    height: f32,
+    width: i32,
+    height: i32,
 }
 
 pub struct Metal4Renderer {
@@ -130,6 +136,15 @@ impl Metal4Renderer {
         }
 
         Self::new_internal(device, Some(layer), !transparent)
+    }
+
+    /// Creates a Metal4Renderer with no `CAMetalLayer`, for offscreen
+    /// rendering via `render_scene_to_image` — see that method and
+    /// `MetalRenderer::new_headless` for the equivalent Metal 3 path.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_headless() -> Self {
+        let device = Self::create_device();
+        Self::new_internal(device, None, true)
     }
 
     fn create_device() -> metal::Device {
@@ -547,6 +562,138 @@ impl Metal4Renderer {
         };
     }
 
+    /// Renders a scene to an offscreen texture and reads back the pixels —
+    /// no window, `CAMetalLayer`, or drawable involved. Mirrors
+    /// `MetalRenderer::render_scene_to_image`, with the same one-command-
+    /// buffer serialization `draw()` uses instead of that method's
+    /// synchronous `wait_until_completed` (there's no `MTL4CommandBuffer`
+    /// equivalent of that call — completion is only observable via an
+    /// `MTLSharedEvent`, so this reuses the renderer's own).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn render_scene_to_image(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> anyhow::Result<image::RgbaImage> {
+        use anyhow::bail;
+
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            bail!("metal4: invalid size for render_scene_to_image: {:?}", size);
+        }
+
+        if !scene.paths.is_empty()
+            || !scene.shadows.is_empty()
+            || !scene.underlines.is_empty()
+            || !scene.monochrome_sprites.is_empty()
+            || !scene.polychrome_sprites.is_empty()
+            || !scene.surfaces.is_empty()
+        {
+            log::warn!(
+                "metal4: scene has non-quad primitives that this milestone renderer does not draw"
+            );
+        }
+
+        let texture_descriptor = metal::TextureDescriptor::new();
+        texture_descriptor.set_width(size.width.0 as u64);
+        texture_descriptor.set_height(size.height.0 as u64);
+        texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        texture_descriptor.set_usage(
+            metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+        );
+        // `Shared`, not `Managed` (which is what MetalRenderer's Metal 3
+        // path uses): Shared needs no explicit CPU/GPU synchronization on
+        // either unified or discrete memory, sidestepping the blit-encoder
+        // sync MetalRenderer needs — encoding that blit under Metal 4 would
+        // mean a whole extra MTL4ComputeCommandEncoder pass (Metal 4 folds
+        // MTLBlitCommandEncoder into it), not worth it for a headless test
+        // helper that isn't on any performance-sensitive path.
+        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+        let legacy_target_texture = self.device.new_texture(&texture_descriptor);
+        let target_texture: Retained<ProtocolObject<dyn objc2_metal::MTLTexture>> =
+            unsafe { bridge_retain(legacy_target_texture.as_ptr() as *mut c_void) };
+
+        unsafe {
+            self.residency_set.addAllocation(target_texture.as_ref());
+            self.residency_set.commit();
+            self.residency_set.requestResidency();
+        }
+
+        let frame_number = self.frame_number.get() + 1;
+        self.frame_number.set(frame_number);
+        if frame_number > 1 {
+            let previous = frame_number - 1;
+            let signaled =
+                unsafe { self.shared_event.waitUntilSignaledValue_timeoutMS(previous, 1000) };
+            if !signaled {
+                log::error!("metal4: timed out waiting for frame {previous} to finish on the GPU");
+            }
+        }
+
+        unsafe { self.allocator.reset() };
+        unsafe {
+            self.command_buffer
+                .beginCommandBufferWithAllocator(&self.allocator)
+        };
+
+        let render_pass_descriptor = unsafe { MTL4RenderPassDescriptor::new() };
+        unsafe {
+            let color_attachment = render_pass_descriptor.colorAttachments().objectAtIndexedSubscript(0);
+            color_attachment.setTexture(Some(&target_texture));
+            color_attachment.setLoadAction(MTLLoadAction::Clear);
+            color_attachment.setStoreAction(MTLStoreAction::Store);
+            color_attachment.setClearColor(MTLClearColor {
+                red: 0.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: 1.0,
+            });
+        }
+
+        let encoder = unsafe {
+            self.command_buffer
+                .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
+        }
+        .expect("metal4: failed to create a render command encoder");
+
+        unsafe {
+            encoder.setViewport(objc2_metal::MTLViewport {
+                originX: 0.0,
+                originY: 0.0,
+                width: i32::from(size.width) as f64,
+                height: i32::from(size.height) as f64,
+                znear: 0.0,
+                zfar: 1.0,
+            });
+        }
+
+        if !scene.quads.is_empty() {
+            self.draw_quads(&scene.quads, size, &encoder);
+        }
+
+        unsafe { encoder.endEncoding() };
+        unsafe { self.command_buffer.endCommandBuffer() };
+
+        let mut command_buffers: [NonNull<ProtocolObject<dyn MTL4CommandBuffer>>; 1] =
+            [NonNull::from(&*self.command_buffer)];
+        unsafe {
+            self.queue
+                .commit_count(NonNull::from(&mut command_buffers[0]), 1)
+        };
+        unsafe {
+            self.queue.signalEvent_value(
+                ProtocolObject::from_ref(&*self.shared_event),
+                frame_number,
+            )
+        };
+        let signaled =
+            unsafe { self.shared_event.waitUntilSignaledValue_timeoutMS(frame_number, 5000) };
+        if !signaled {
+            bail!("metal4: timed out waiting for the headless frame to finish on the GPU");
+        }
+
+        read_texture_to_image(&legacy_target_texture)
+    }
+
     fn draw_quads(
         &self,
         quads: &[Quad],
@@ -584,8 +731,8 @@ impl Metal4Renderer {
                 .cast::<ViewportSize>()
                 .as_ptr()
                 .write(ViewportSize {
-                    width: i32::from(viewport_size.width) as f32,
-                    height: i32::from(viewport_size.height) as f32,
+                    width: i32::from(viewport_size.width),
+                    height: i32::from(viewport_size.height),
                 });
         }
 
@@ -608,5 +755,128 @@ impl Metal4Renderer {
                 quads.len(),
             );
         }
+    }
+}
+
+/// Duplicated from `metal_renderer.rs`'s private helper of the same name
+/// rather than widening that file's visibility — this keeps `draw()`'s file
+/// (a real upstream-churn hotspot, see the module doc comment) at zero
+/// touches from this renderer.
+#[cfg(any(test, feature = "test-support"))]
+fn read_texture_to_image(texture: &metal::TextureRef) -> anyhow::Result<image::RgbaImage> {
+    use anyhow::Context as _;
+
+    let width = texture.width() as u32;
+    let height = texture.height() as u32;
+    let bytes_per_row = width as usize * 4;
+    let mut pixels = vec![0u8; height as usize * bytes_per_row];
+
+    let region = metal::MTLRegion {
+        origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+        size: metal::MTLSize {
+            width: width as u64,
+            height: height as u64,
+            depth: 1,
+        },
+    };
+    texture.get_bytes(
+        pixels.as_mut_ptr() as *mut std::ffi::c_void,
+        bytes_per_row as u64,
+        region,
+        0,
+    );
+
+    // Convert BGRA to RGBA (swap B and R channels)
+    for chunk in pixels.chunks_exact_mut(4) {
+        chunk.swap(0, 2);
+    }
+
+    image::RgbaImage::from_raw(width, height, pixels)
+        .context("failed to create RgbaImage from pixel data")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Bounds, Corners, Point, ScaledPixels, hsla, point, size};
+
+    /// Renders three solid-colour quads (red / green / blue, at known
+    /// positions with a gap between them) through the real Metal 4 path —
+    /// no window, no `CAMetalLayer`, no app skin/vibrancy — and writes the
+    /// result to a PNG for visual inspection, in addition to sampling
+    /// specific pixels to assert the colours actually landed where
+    /// expected. This is deliberately isolated from the full app (whose
+    /// glass/vibrancy chrome makes it hard to tell what the renderer itself
+    /// produced vs. what the window material drew on top).
+    #[test]
+    fn quads_render_at_expected_positions_and_colors() {
+        let canvas = size(600i32, 400i32);
+        let canvas_scaled = size(
+            ScaledPixels(canvas.width as f32),
+            ScaledPixels(canvas.height as f32),
+        );
+        let full_mask = gpui::ContentMask {
+            bounds: Bounds::new(Point::default(), canvas_scaled),
+        };
+
+        let make_quad = |x: f32, y: f32, w: f32, h: f32, color: gpui::Hsla| Quad {
+            bounds: Bounds::new(
+                point(ScaledPixels(x), ScaledPixels(y)),
+                size(ScaledPixels(w), ScaledPixels(h)),
+            ),
+            content_mask: full_mask,
+            background: color.into(),
+            corner_radii: Corners::default(),
+            ..Default::default()
+        };
+
+        let red = hsla(0.0, 1.0, 0.5, 1.0);
+        let green = hsla(0.33, 1.0, 0.5, 1.0);
+        let blue = hsla(0.66, 1.0, 0.5, 1.0);
+
+        let mut scene = Scene::default();
+        scene.quads.push(make_quad(20.0, 20.0, 150.0, 150.0, red));
+        scene.quads.push(make_quad(225.0, 20.0, 150.0, 150.0, green));
+        scene.quads.push(make_quad(430.0, 20.0, 150.0, 150.0, blue));
+
+        let mut renderer = Metal4Renderer::new_headless();
+        let image = renderer
+            .render_scene_to_image(&scene, size(canvas.width.into(), canvas.height.into()))
+            .expect("metal4 headless render failed");
+
+        let out_path = std::env::temp_dir().join("metal4_quads_test.png");
+        image
+            .save(&out_path)
+            .expect("failed to save metal4 quads test PNG");
+        eprintln!("metal4 quads test image written to {}", out_path.display());
+
+        assert_eq!(image.width(), canvas.width as u32);
+        assert_eq!(image.height(), canvas.height as u32);
+
+        let assert_pixel_matches = |x: u32, y: u32, expected: gpui::Hsla, label: &str| {
+            let expected_rgba = expected.to_rgb();
+            let pixel = image.get_pixel(x, y);
+            let diff = |a: u8, b: f32| (a as f32 - b * 255.0).abs();
+            assert!(
+                diff(pixel[0], expected_rgba.r) < 10.0
+                    && diff(pixel[1], expected_rgba.g) < 10.0
+                    && diff(pixel[2], expected_rgba.b) < 10.0,
+                "{label} at ({x},{y}): got {:?}, expected ~{:?}",
+                pixel,
+                expected_rgba
+            );
+        };
+
+        // Centers of each quad.
+        assert_pixel_matches(95, 95, red, "red quad");
+        assert_pixel_matches(300, 95, green, "green quad");
+        assert_pixel_matches(505, 95, blue, "blue quad");
+
+        // The gaps between quads and the area below them should be the
+        // clear color (opaque black, since `new_headless` passes `true`
+        // for `opaque` — see `new_internal`).
+        let black = hsla(0.0, 0.0, 0.0, 1.0);
+        assert_pixel_matches(190, 95, black, "gap between red and green");
+        assert_pixel_matches(300, 300, black, "below the quads");
     }
 }

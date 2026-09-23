@@ -1,6 +1,6 @@
 //! A Metal 4 renderer, built up one primitive at a time. Covers solid-color
-//! quads and underlines so far — see `draw()`'s doc comment for the exact,
-//! current scope.
+//! quads, underlines, and shadows so far — see `draw()`'s doc comment for
+//! the exact, current scope.
 //!
 //! Ported from `metal_renderer.rs`'s device/layer setup (unchanged — Metal 4
 //! doesn't touch `CAMetalLayer`/drawable acquisition at all) but the
@@ -38,7 +38,7 @@
 
 use crate::metal_atlas::MetalAtlas;
 use foreign_types::{ForeignType, ForeignTypeRef};
-use gpui::{DevicePixels, Quad, Scene, Size, Underline};
+use gpui::{DevicePixels, Quad, Scene, Shadow, Size, Underline};
 use objc::{msg_send, sel, sel_impl};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -113,6 +113,7 @@ pub struct Metal4Renderer {
     residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
     quad_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     underline_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    shadow_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
     viewport_size_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Reallocated (and re-added to the residency set) whenever a frame
@@ -120,6 +121,8 @@ pub struct Metal4Renderer {
     quads_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
     /// Same growth strategy as `quads_buffer`, for `gpui::Underline`s.
     underlines_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
+    /// Same growth strategy as `quads_buffer`, for `gpui::Shadow`s.
+    shadows_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
     /// Serializes frames: signalled after each commit, waited on before the
     /// next frame reuses the (sole) allocator/command buffer/quads buffer.
     shared_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
@@ -280,6 +283,16 @@ impl Metal4Renderer {
             residency_set.requestResidency();
         }
 
+        let shadows_buffer = Self::new_buffer(
+            &mtl4_device,
+            mem::size_of::<gpui::Shadow>() * MAX_QUADS_PER_FRAME_INITIAL,
+        );
+        unsafe {
+            residency_set.addAllocation(shadows_buffer.as_ref());
+            residency_set.commit();
+            residency_set.requestResidency();
+        }
+
         let library = Self::load_shader_library(&device);
         let compiler = {
             let descriptor = unsafe { MTL4CompilerDescriptor::new() };
@@ -295,6 +308,8 @@ impl Metal4Renderer {
             "underline_vertex",
             "underline_fragment",
         );
+        let shadow_pipeline_state =
+            Self::compile_pipeline(&compiler, &library, "shadow_vertex", "shadow_fragment");
 
         Self {
             device,
@@ -309,10 +324,12 @@ impl Metal4Renderer {
             residency_set,
             quad_pipeline_state,
             underline_pipeline_state,
+            shadow_pipeline_state,
             unit_vertices,
             viewport_size_buffer,
             quads_buffer: RefCell::new((quads_buffer, MAX_QUADS_PER_FRAME_INITIAL)),
             underlines_buffer: RefCell::new((underlines_buffer, MAX_QUADS_PER_FRAME_INITIAL)),
+            shadows_buffer: RefCell::new((shadows_buffer, MAX_QUADS_PER_FRAME_INITIAL)),
             shared_event,
             frame_number: Cell::new(0),
         }
@@ -464,9 +481,10 @@ impl Metal4Renderer {
         // nothing to do
     }
 
-    /// Renders `scene.quads` and `scene.underlines` only — every other
-    /// primitive kind is silently skipped. This is the documented scope of
-    /// the Metal 4 milestone so far, not a bug: see the module doc comment.
+    /// Renders `scene.shadows`, `scene.quads`, and `scene.underlines` only —
+    /// every other primitive kind is silently skipped. This is the
+    /// documented scope of the Metal 4 milestone so far, not a bug: see the
+    /// module doc comment.
     pub fn draw(&mut self, scene: &Scene) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
@@ -477,15 +495,13 @@ impl Metal4Renderer {
         };
 
         if !scene.paths.is_empty()
-            || !scene.shadows.is_empty()
             || !scene.monochrome_sprites.is_empty()
             || !scene.polychrome_sprites.is_empty()
             || !scene.surfaces.is_empty()
         {
             log::warn!(
-                "metal4: scene has primitives ({} paths, {} shadows, {} mono, {} poly, {} surfaces) that this milestone renderer does not draw",
+                "metal4: scene has primitives ({} paths, {} mono, {} poly, {} surfaces) that this milestone renderer does not draw",
                 scene.paths.len(),
-                scene.shadows.len(),
                 scene.monochrome_sprites.len(),
                 scene.polychrome_sprites.len(),
                 scene.surfaces.len(),
@@ -561,6 +577,9 @@ impl Metal4Renderer {
             });
         }
 
+        if !scene.shadows.is_empty() {
+            self.draw_shadows(&scene.shadows, viewport_size_px, &encoder);
+        }
         if !scene.quads.is_empty() {
             self.draw_quads(&scene.quads, viewport_size_px, &encoder);
         }
@@ -618,7 +637,6 @@ impl Metal4Renderer {
         }
 
         if !scene.paths.is_empty()
-            || !scene.shadows.is_empty()
             || !scene.monochrome_sprites.is_empty()
             || !scene.polychrome_sprites.is_empty()
             || !scene.surfaces.is_empty()
@@ -701,6 +719,9 @@ impl Metal4Renderer {
             });
         }
 
+        if !scene.shadows.is_empty() {
+            self.draw_shadows(&scene.shadows, size, &encoder);
+        }
         if !scene.quads.is_empty() {
             self.draw_quads(&scene.quads, size, &encoder);
         }
@@ -860,6 +881,74 @@ impl Metal4Renderer {
                 0,
                 6,
                 underlines.len(),
+            );
+        }
+    }
+
+    /// Mirrors `draw_quads`/`draw_underlines` exactly — same buffer-growth
+    /// strategy, same three argument-table indices (`ShadowInputIndex` has
+    /// the same numeric layout too), just the shadow pipeline and instance
+    /// type. The shadow shaders do all the blur/corner-radius math
+    /// themselves from the raw `Shadow` fields; nothing extra to bind here.
+    fn draw_shadows(
+        &self,
+        shadows: &[Shadow],
+        viewport_size: Size<DevicePixels>,
+        encoder: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
+    ) {
+        {
+            let mut shadows_buffer = self.shadows_buffer.borrow_mut();
+            if shadows.len() > shadows_buffer.1 {
+                let new_capacity = shadows.len().next_power_of_two();
+                let new_buffer =
+                    Self::new_buffer(&self.mtl4_device, mem::size_of::<Shadow>() * new_capacity);
+                unsafe {
+                    self.residency_set
+                        .removeAllocation(shadows_buffer.0.as_ref());
+                    self.residency_set.addAllocation(new_buffer.as_ref());
+                    self.residency_set.commit();
+                    self.residency_set.requestResidency();
+                }
+                *shadows_buffer = (new_buffer, new_capacity);
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    shadows.as_ptr(),
+                    shadows_buffer.0.contents().as_ptr() as *mut Shadow,
+                    shadows.len(),
+                );
+            }
+        }
+        let shadows_buffer = self.shadows_buffer.borrow();
+
+        unsafe {
+            self.viewport_size_buffer
+                .contents()
+                .cast::<ViewportSize>()
+                .as_ptr()
+                .write(ViewportSize {
+                    width: i32::from(viewport_size.width),
+                    height: i32::from(viewport_size.height),
+                });
+        }
+
+        unsafe {
+            self.argument_table
+                .setAddress_atIndex(self.unit_vertices.gpuAddress(), 0);
+            self.argument_table
+                .setAddress_atIndex(shadows_buffer.0.gpuAddress(), 1);
+            self.argument_table
+                .setAddress_atIndex(self.viewport_size_buffer.gpuAddress(), 2);
+            encoder.setArgumentTable_atStages(
+                &self.argument_table,
+                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+            );
+            encoder.setRenderPipelineState(&self.shadow_pipeline_state);
+            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                MTLPrimitiveType::Triangle,
+                0,
+                6,
+                shadows.len(),
             );
         }
     }
@@ -1025,6 +1114,66 @@ mod tests {
         let black = hsla(0.0, 0.0, 0.0, 1.0);
         assert_pixel_matches(&image, 200, 10, black, "above the underline");
         assert_pixel_matches(&image, 200, 80, black, "below the underline");
+    }
+
+    /// Renders a single hard-edged (`blur_radius: 0`), unrounded shadow
+    /// through the real Metal 4 path — same pattern as the quad/underline
+    /// tests. `blur_radius: 0` takes shadow_fragment's `quad_sdf` branch
+    /// instead of its Gaussian-blur one, giving a crisp rectangle that's
+    /// easy to pixel-test precisely; the blur math itself is exercised by
+    /// every real shadow the app draws once this ships, just not asserted
+    /// pixel-by-pixel here.
+    #[test]
+    fn shadows_render_at_expected_positions_and_colors() {
+        let canvas = size(300i32, 300i32);
+        let canvas_scaled = size(
+            ScaledPixels(canvas.width as f32),
+            ScaledPixels(canvas.height as f32),
+        );
+        let full_mask = gpui::ContentMask {
+            bounds: Bounds::new(Point::default(), canvas_scaled),
+        };
+
+        let purple = hsla(0.75, 1.0, 0.5, 1.0);
+        let shadow_bounds = Bounds::new(
+            point(ScaledPixels(75.0), ScaledPixels(75.0)),
+            size(ScaledPixels(150.0), ScaledPixels(150.0)),
+        );
+
+        let shadow = Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(0.0),
+            bounds: shadow_bounds,
+            corner_radii: Corners::default(),
+            content_mask: full_mask,
+            color: purple,
+            element_bounds: shadow_bounds,
+            element_corner_radii: Corners::default(),
+            inset: 0,
+            pad: 0,
+        };
+
+        let mut scene = Scene::default();
+        scene.shadows.push(shadow);
+
+        let mut renderer = Metal4Renderer::new_headless();
+        let image = renderer
+            .render_scene_to_image(&scene, size(canvas.width.into(), canvas.height.into()))
+            .expect("metal4 headless render failed");
+
+        let out_path = std::env::temp_dir().join("metal4_shadow_test.png");
+        image
+            .save(&out_path)
+            .expect("failed to save metal4 shadow test PNG");
+        eprintln!("metal4 shadow test image written to {}", out_path.display());
+
+        assert_pixel_matches(&image, 150, 150, purple, "shadow center");
+        assert_pixel_matches(&image, 80, 80, purple, "shadow, near top-left corner");
+        assert_pixel_matches(&image, 219, 219, purple, "shadow, near bottom-right corner");
+
+        let black = hsla(0.0, 0.0, 0.0, 1.0);
+        assert_pixel_matches(&image, 20, 20, black, "outside the shadow, top-left");
+        assert_pixel_matches(&image, 280, 280, black, "outside the shadow, bottom-right");
     }
 }
 

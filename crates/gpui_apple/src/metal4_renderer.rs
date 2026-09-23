@@ -1,4 +1,6 @@
-//! A first-milestone Metal 4 renderer: solid-color quads only.
+//! A Metal 4 renderer, built up one primitive at a time. Covers solid-color
+//! quads and underlines so far — see `draw()`'s doc comment for the exact,
+//! current scope.
 //!
 //! Ported from `metal_renderer.rs`'s device/layer setup (unchanged — Metal 4
 //! doesn't touch `CAMetalLayer`/drawable acquisition at all) but the
@@ -8,11 +10,16 @@
 //! core API"), so every buffer/texture the GPU touches must be explicitly
 //! placed in an `MTLResidencySet`, and bindings go through an
 //! `MTL4ArgumentTable` (a GPU address / `MTLResourceID` table) rather than
-//! per-call `setVertexBuffer:`/`setFragmentTexture:`. The quad vertex/
-//! fragment shaders themselves are untouched and reused byte-for-byte from
-//! the existing `shaders.metallib` — `[[buffer(N)]]` argument-table slots
-//! and classic bind-point indices are the same binding namespace from the
-//! shader's perspective, only how the CPU side populates slot N differs.
+//! per-call `setVertexBuffer:`/`setFragmentTexture:`. The shaders themselves
+//! are untouched and reused byte-for-byte from the existing
+//! `shaders.metallib` — `[[buffer(N)]]` argument-table slots and classic
+//! bind-point indices are the same binding namespace from the shader's
+//! perspective, only how the CPU side populates slot N differs. Each
+//! primitive kind gets its own pipeline (`compile_pipeline`) and its own
+//! growable instance buffer, but all of them reuse the same three
+//! argument-table indices (0=unit vertices, 1=primitive data, 2=viewport
+//! size) one draw call at a time — `QuadInputIndex`/`UnderlineInputIndex`/
+//! etc. all share that exact numeric layout in the shader source.
 //!
 //! Deliberately simplified vs. a production implementation: one command
 //! allocator and one command buffer, fully serialized (each frame waits for
@@ -31,7 +38,7 @@
 
 use crate::metal_atlas::MetalAtlas;
 use foreign_types::{ForeignType, ForeignTypeRef};
-use gpui::{DevicePixels, Quad, Scene, Size};
+use gpui::{DevicePixels, Quad, Scene, Size, Underline};
 use objc::{msg_send, sel, sel_impl};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -104,12 +111,15 @@ pub struct Metal4Renderer {
     /// (the drawable's own residency is `CAMetalLayer.residencySet`, added
     /// to the queue separately in `new` — see the doc comment up top).
     residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
-    pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    quad_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    underline_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
     viewport_size_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Reallocated (and re-added to the residency set) whenever a frame
     /// needs more quads than the current capacity.
     quads_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
+    /// Same growth strategy as `quads_buffer`, for `gpui::Underline`s.
+    underlines_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
     /// Serializes frames: signalled after each commit, waited on before the
     /// next frame reuses the (sole) allocator/command buffer/quads buffer.
     shared_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
@@ -260,7 +270,31 @@ impl Metal4Renderer {
             }
         }
 
-        let pipeline_state = Self::compile_quad_pipeline(&mtl4_device, &device);
+        let underlines_buffer = Self::new_buffer(
+            &mtl4_device,
+            mem::size_of::<gpui::Underline>() * MAX_QUADS_PER_FRAME_INITIAL,
+        );
+        unsafe {
+            residency_set.addAllocation(underlines_buffer.as_ref());
+            residency_set.commit();
+            residency_set.requestResidency();
+        }
+
+        let library = Self::load_shader_library(&device);
+        let compiler = {
+            let descriptor = unsafe { MTL4CompilerDescriptor::new() };
+            mtl4_device
+                .newCompilerWithDescriptor_error(&descriptor)
+                .expect("metal4: device could not create an MTL4Compiler")
+        };
+        let quad_pipeline_state =
+            Self::compile_pipeline(&compiler, &library, "quad_vertex", "quad_fragment");
+        let underline_pipeline_state = Self::compile_pipeline(
+            &compiler,
+            &library,
+            "underline_vertex",
+            "underline_fragment",
+        );
 
         Self {
             device,
@@ -273,10 +307,12 @@ impl Metal4Renderer {
             allocator,
             argument_table,
             residency_set,
-            pipeline_state,
+            quad_pipeline_state,
+            underline_pipeline_state,
             unit_vertices,
             viewport_size_buffer,
             quads_buffer: RefCell::new((quads_buffer, MAX_QUADS_PER_FRAME_INITIAL)),
+            underlines_buffer: RefCell::new((underlines_buffer, MAX_QUADS_PER_FRAME_INITIAL)),
             shared_event,
             frame_number: Cell::new(0),
         }
@@ -308,18 +344,17 @@ impl Metal4Renderer {
         buffer
     }
 
-    fn compile_quad_pipeline(
-        mtl4_device: &ProtocolObject<dyn MTLDevice>,
+    /// Loads the exact same, unmodified shaders.metallib MetalRenderer
+    /// builds from — the shader functions' `[[buffer(N)]]` argument-table
+    /// slots are the same binding namespace regardless of whether the CPU
+    /// side populated them via classic setVertexBuffer:/setFragmentBuffer:
+    /// or an MTL4ArgumentTable. Mirrors metal_renderer.rs's own
+    /// runtime_shaders/precompiled split (this build enables the
+    /// `runtime_shaders` feature, so only that branch is actually exercised
+    /// here, but both are kept for parity).
+    fn load_shader_library(
         legacy_device: &metal::Device,
-    ) -> Retained<ProtocolObject<dyn MTLRenderPipelineState>> {
-        // Reuse the exact same, unmodified shaders.metal MetalRenderer
-        // builds from — the quad_vertex/quad_fragment functions'
-        // `[[buffer(N)]]` argument-table slots are the same binding
-        // namespace regardless of whether the CPU side populated them via
-        // classic setVertexBuffer:/setFragmentBuffer: or an MTL4ArgumentTable.
-        // Mirrors metal_renderer.rs's own runtime_shaders/precompiled split
-        // (this build enables the `runtime_shaders` feature, so only that
-        // branch is actually exercised here, but both are kept for parity).
+    ) -> Retained<ProtocolObject<dyn objc2_metal::MTLLibrary>> {
         #[cfg(feature = "runtime_shaders")]
         let legacy_library = {
             const SHADERS_SOURCE_FILE: &str =
@@ -338,27 +373,27 @@ impl Metal4Renderer {
         };
         // Bridge the legacy `metal::Library` into an objc2 `MTLLibrary` the
         // same way as the device — it's the same underlying `id<MTLLibrary>`.
-        let library: Retained<ProtocolObject<dyn objc2_metal::MTLLibrary>> =
-            unsafe { bridge_retain(legacy_library.as_ptr() as *mut c_void) };
+        unsafe { bridge_retain(legacy_library.as_ptr() as *mut c_void) }
+    }
 
-        let compiler = {
-            let descriptor = unsafe { MTL4CompilerDescriptor::new() };
-            mtl4_device
-                .newCompilerWithDescriptor_error(&descriptor)
-                .expect("metal4: device could not create an MTL4Compiler")
-        };
-
+    fn compile_pipeline(
+        compiler: &ProtocolObject<dyn MTL4Compiler>,
+        library: &ProtocolObject<dyn objc2_metal::MTLLibrary>,
+        vertex_fn_name: &str,
+        fragment_fn_name: &str,
+    ) -> Retained<ProtocolObject<dyn MTLRenderPipelineState>> {
         let vertex_function_descriptor = unsafe { MTL4LibraryFunctionDescriptor::new() };
         unsafe {
-            vertex_function_descriptor.setLibrary(Some(&library));
+            vertex_function_descriptor.setLibrary(Some(library));
             vertex_function_descriptor
-                .setName(Some(&objc2_foundation::NSString::from_str("quad_vertex")));
+                .setName(Some(&objc2_foundation::NSString::from_str(vertex_fn_name)));
         }
         let fragment_function_descriptor = unsafe { MTL4LibraryFunctionDescriptor::new() };
         unsafe {
-            fragment_function_descriptor.setLibrary(Some(&library));
-            fragment_function_descriptor
-                .setName(Some(&objc2_foundation::NSString::from_str("quad_fragment")));
+            fragment_function_descriptor.setLibrary(Some(library));
+            fragment_function_descriptor.setName(Some(&objc2_foundation::NSString::from_str(
+                fragment_fn_name,
+            )));
         }
 
         let pipeline_descriptor = unsafe { MTL4RenderPipelineDescriptor::new() };
@@ -382,7 +417,7 @@ impl Metal4Renderer {
                 &pipeline_descriptor,
                 None,
             )
-            .expect("metal4: compiler could not build the quad render pipeline state")
+            .unwrap_or_else(|_| panic!("metal4: compiler could not build the {vertex_fn_name}/{fragment_fn_name} pipeline state"))
     }
 
     pub fn layer(&self) -> Option<&metal::MetalLayerRef> {
@@ -429,9 +464,9 @@ impl Metal4Renderer {
         // nothing to do
     }
 
-    /// Renders `scene.quads` only — every other primitive kind is silently
-    /// skipped. This is the documented scope of the first Metal 4 milestone,
-    /// not a bug: see the module doc comment.
+    /// Renders `scene.quads` and `scene.underlines` only — every other
+    /// primitive kind is silently skipped. This is the documented scope of
+    /// the Metal 4 milestone so far, not a bug: see the module doc comment.
     pub fn draw(&mut self, scene: &Scene) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
@@ -443,16 +478,14 @@ impl Metal4Renderer {
 
         if !scene.paths.is_empty()
             || !scene.shadows.is_empty()
-            || !scene.underlines.is_empty()
             || !scene.monochrome_sprites.is_empty()
             || !scene.polychrome_sprites.is_empty()
             || !scene.surfaces.is_empty()
         {
             log::warn!(
-                "metal4: scene has non-quad primitives ({} paths, {} shadows, {} underlines, {} mono, {} poly, {} surfaces) that this milestone renderer does not draw",
+                "metal4: scene has primitives ({} paths, {} shadows, {} mono, {} poly, {} surfaces) that this milestone renderer does not draw",
                 scene.paths.len(),
                 scene.shadows.len(),
-                scene.underlines.len(),
                 scene.monochrome_sprites.len(),
                 scene.polychrome_sprites.len(),
                 scene.surfaces.len(),
@@ -531,6 +564,9 @@ impl Metal4Renderer {
         if !scene.quads.is_empty() {
             self.draw_quads(&scene.quads, viewport_size_px, &encoder);
         }
+        if !scene.underlines.is_empty() {
+            self.draw_underlines(&scene.underlines, viewport_size_px, &encoder);
+        }
 
         unsafe { encoder.endEncoding() };
         unsafe { self.command_buffer.endCommandBuffer() };
@@ -583,13 +619,12 @@ impl Metal4Renderer {
 
         if !scene.paths.is_empty()
             || !scene.shadows.is_empty()
-            || !scene.underlines.is_empty()
             || !scene.monochrome_sprites.is_empty()
             || !scene.polychrome_sprites.is_empty()
             || !scene.surfaces.is_empty()
         {
             log::warn!(
-                "metal4: scene has non-quad primitives that this milestone renderer does not draw"
+                "metal4: scene has primitives that this milestone renderer does not draw"
             );
         }
 
@@ -669,6 +704,9 @@ impl Metal4Renderer {
         if !scene.quads.is_empty() {
             self.draw_quads(&scene.quads, size, &encoder);
         }
+        if !scene.underlines.is_empty() {
+            self.draw_underlines(&scene.underlines, size, &encoder);
+        }
 
         unsafe { encoder.endEncoding() };
         unsafe { self.command_buffer.endCommandBuffer() };
@@ -747,12 +785,81 @@ impl Metal4Renderer {
                 &self.argument_table,
                 MTLRenderStages::Vertex | MTLRenderStages::Fragment,
             );
-            encoder.setRenderPipelineState(&self.pipeline_state);
+            encoder.setRenderPipelineState(&self.quad_pipeline_state);
             encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
                 MTLPrimitiveType::Triangle,
                 0,
                 6,
                 quads.len(),
+            );
+        }
+    }
+
+    /// Mirrors `draw_quads` exactly — same buffer-growth strategy, same
+    /// argument-table indices (`UnderlineInputIndex` has the identical
+    /// numeric layout to `QuadInputIndex`: vertices=0, primitive-data=1,
+    /// viewport=2), just a different pipeline and instance type.
+    fn draw_underlines(
+        &self,
+        underlines: &[Underline],
+        viewport_size: Size<DevicePixels>,
+        encoder: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
+    ) {
+        {
+            let mut underlines_buffer = self.underlines_buffer.borrow_mut();
+            if underlines.len() > underlines_buffer.1 {
+                let new_capacity = underlines.len().next_power_of_two();
+                let new_buffer = Self::new_buffer(
+                    &self.mtl4_device,
+                    mem::size_of::<Underline>() * new_capacity,
+                );
+                unsafe {
+                    self.residency_set
+                        .removeAllocation(underlines_buffer.0.as_ref());
+                    self.residency_set.addAllocation(new_buffer.as_ref());
+                    self.residency_set.commit();
+                    self.residency_set.requestResidency();
+                }
+                *underlines_buffer = (new_buffer, new_capacity);
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    underlines.as_ptr(),
+                    underlines_buffer.0.contents().as_ptr() as *mut Underline,
+                    underlines.len(),
+                );
+            }
+        }
+        let underlines_buffer = self.underlines_buffer.borrow();
+
+        unsafe {
+            self.viewport_size_buffer
+                .contents()
+                .cast::<ViewportSize>()
+                .as_ptr()
+                .write(ViewportSize {
+                    width: i32::from(viewport_size.width),
+                    height: i32::from(viewport_size.height),
+                });
+        }
+
+        unsafe {
+            self.argument_table
+                .setAddress_atIndex(self.unit_vertices.gpuAddress(), 0);
+            self.argument_table
+                .setAddress_atIndex(underlines_buffer.0.gpuAddress(), 1);
+            self.argument_table
+                .setAddress_atIndex(self.viewport_size_buffer.gpuAddress(), 2);
+            encoder.setArgumentTable_atStages(
+                &self.argument_table,
+                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+            );
+            encoder.setRenderPipelineState(&self.underline_pipeline_state);
+            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                MTLPrimitiveType::Triangle,
+                0,
+                6,
+                underlines.len(),
             );
         }
     }
@@ -853,30 +960,91 @@ mod tests {
         assert_eq!(image.width(), canvas.width as u32);
         assert_eq!(image.height(), canvas.height as u32);
 
-        let assert_pixel_matches = |x: u32, y: u32, expected: gpui::Hsla, label: &str| {
-            let expected_rgba = expected.to_rgb();
-            let pixel = image.get_pixel(x, y);
-            let diff = |a: u8, b: f32| (a as f32 - b * 255.0).abs();
-            assert!(
-                diff(pixel[0], expected_rgba.r) < 10.0
-                    && diff(pixel[1], expected_rgba.g) < 10.0
-                    && diff(pixel[2], expected_rgba.b) < 10.0,
-                "{label} at ({x},{y}): got {:?}, expected ~{:?}",
-                pixel,
-                expected_rgba
-            );
-        };
-
         // Centers of each quad.
-        assert_pixel_matches(95, 95, red, "red quad");
-        assert_pixel_matches(300, 95, green, "green quad");
-        assert_pixel_matches(505, 95, blue, "blue quad");
+        assert_pixel_matches(&image, 95, 95, red, "red quad");
+        assert_pixel_matches(&image, 300, 95, green, "green quad");
+        assert_pixel_matches(&image, 505, 95, blue, "blue quad");
 
         // The gaps between quads and the area below them should be the
         // clear color (opaque black, since `new_headless` passes `true`
         // for `opaque` — see `new_internal`).
         let black = hsla(0.0, 0.0, 0.0, 1.0);
-        assert_pixel_matches(190, 95, black, "gap between red and green");
-        assert_pixel_matches(300, 300, black, "below the quads");
+        assert_pixel_matches(&image, 190, 95, black, "gap between red and green");
+        assert_pixel_matches(&image, 300, 300, black, "below the quads");
     }
+
+    /// Renders a single straight (non-wavy) underline through the real
+    /// Metal 4 path, mirroring `quads_render_at_expected_positions_and_colors`
+    /// — this is `draw_underlines`'s first exercise, added right after the
+    /// quad milestone since `UnderlineInputIndex` has the exact same
+    /// numeric layout as `QuadInputIndex` and the pipeline/buffer plumbing
+    /// is a near-verbatim copy of the quad path (see its doc comment).
+    #[test]
+    fn underlines_render_at_expected_positions_and_colors() {
+        let canvas = size(400i32, 100i32);
+        let canvas_scaled = size(
+            ScaledPixels(canvas.width as f32),
+            ScaledPixels(canvas.height as f32),
+        );
+        let full_mask = gpui::ContentMask {
+            bounds: Bounds::new(Point::default(), canvas_scaled),
+        };
+
+        let yellow = hsla(0.16, 1.0, 0.5, 1.0);
+
+        let underline = Underline {
+            order: 0,
+            pad: 0,
+            bounds: Bounds::new(
+                point(ScaledPixels(50.0), ScaledPixels(40.0)),
+                size(ScaledPixels(300.0), ScaledPixels(4.0)),
+            ),
+            content_mask: full_mask,
+            color: yellow,
+            thickness: ScaledPixels(4.0),
+            wavy: false.into(),
+        };
+
+        let mut scene = Scene::default();
+        scene.underlines.push(underline);
+
+        let mut renderer = Metal4Renderer::new_headless();
+        let image = renderer
+            .render_scene_to_image(&scene, size(canvas.width.into(), canvas.height.into()))
+            .expect("metal4 headless render failed");
+
+        let out_path = std::env::temp_dir().join("metal4_underline_test.png");
+        image
+            .save(&out_path)
+            .expect("failed to save metal4 underline test PNG");
+        eprintln!("metal4 underline test image written to {}", out_path.display());
+
+        assert_pixel_matches(&image, 200, 41, yellow, "underline, mid-span");
+        assert_pixel_matches(&image, 60, 41, yellow, "underline, near left end");
+
+        let black = hsla(0.0, 0.0, 0.0, 1.0);
+        assert_pixel_matches(&image, 200, 10, black, "above the underline");
+        assert_pixel_matches(&image, 200, 80, black, "below the underline");
+    }
+}
+
+#[cfg(test)]
+fn assert_pixel_matches(
+    image: &image::RgbaImage,
+    x: u32,
+    y: u32,
+    expected: gpui::Hsla,
+    label: &str,
+) {
+    let expected_rgba = expected.to_rgb();
+    let pixel = image.get_pixel(x, y);
+    let diff = |a: u8, b: f32| (a as f32 - b * 255.0).abs();
+    assert!(
+        diff(pixel[0], expected_rgba.r) < 10.0
+            && diff(pixel[1], expected_rgba.g) < 10.0
+            && diff(pixel[2], expected_rgba.b) < 10.0,
+        "{label} at ({x},{y}): got {:?}, expected ~{:?}",
+        pixel,
+        expected_rgba
+    );
 }

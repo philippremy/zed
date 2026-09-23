@@ -4,5 +4,7 @@
 //! This crate contains the Metal renderer and GPU resource management shared
 //! by GPUI's Apple platform backends.
 
+mod metal4_capability;
 mod metal_atlas;
 pub mod metal_renderer;
+pub mod renderer_select;

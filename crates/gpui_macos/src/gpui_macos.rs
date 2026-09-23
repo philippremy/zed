@@ -15,7 +15,7 @@ mod system_notifications;
 #[cfg(feature = "screen-capture")]
 mod screen_capture;
 
-use gpui_apple::metal_renderer as renderer;
+use gpui_apple::renderer_select as renderer;
 
 pub mod metal_renderer {
     pub use gpui_apple::metal_renderer::{PathRasterizationVertex, PathSprite, SurfaceBounds};

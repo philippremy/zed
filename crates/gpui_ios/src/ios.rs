@@ -6,6 +6,7 @@ mod display;
 mod events;
 mod menu;
 mod platform;
+mod pointer;
 mod text_input;
 mod text_system;
 mod window;

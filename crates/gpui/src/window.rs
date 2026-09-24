@@ -6059,14 +6059,52 @@ impl Window {
                 self.dispatch_mouse_event(&up, cx);
             }
             RecognizedTouchGesture::TouchDrag(touch_drag) => {
-                self.mouse_position = touch_drag.start_position;
+                let started = touch_drag.phase == crate::TouchPhase::Started;
+                self.mouse_position = if started {
+                    touch_drag.start_position
+                } else {
+                    touch_drag.position
+                };
                 cx.propagate_event = true;
                 self.default_prevented = false;
-                let started = touch_drag.phase == crate::TouchPhase::Started;
                 self.dispatch_mouse_event(&touch_drag, cx);
                 if started {
                     self.touch_gestures
                         .resolve_touch_drag(self.default_prevented);
+                }
+                // An element-started drag (`on_drag`) follows the finger like it would the
+                // cursor: a release drops it where the finger lifted, a cancel abandons it.
+                if cx.has_active_drag() {
+                    match touch_drag.phase {
+                        crate::TouchPhase::Started => self.refresh(),
+                        crate::TouchPhase::Moved => {
+                            cx.propagate_event = true;
+                            self.dispatch_mouse_event(
+                                &MouseMoveEvent {
+                                    position: touch_drag.position,
+                                    pressed_button: Some(MouseButton::Left),
+                                    modifiers: self.modifiers,
+                                },
+                                cx,
+                            );
+                        }
+                        crate::TouchPhase::Ended => {
+                            cx.propagate_event = true;
+                            self.dispatch_mouse_event(
+                                &MouseUpEvent {
+                                    button: MouseButton::Left,
+                                    position: touch_drag.position,
+                                    modifiers: self.modifiers,
+                                    click_count: 1,
+                                },
+                                cx,
+                            );
+                        }
+                        crate::TouchPhase::Cancelled => {
+                            cx.active_drag = None;
+                            self.refresh();
+                        }
+                    }
                 }
             }
             RecognizedTouchGesture::LongPress(long_press) => {

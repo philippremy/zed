@@ -16,7 +16,7 @@
 //! constructed by combining these two systems into an all-in-one element.
 
 use crate::{
-    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
+    Action, AnyDrag, CursorStyle, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
     Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
     FileDropEvent, FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId,
     InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton,
@@ -24,7 +24,7 @@ use crate::{
     MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent,
     MouseUpEvent, OngoingScroll, Overflow, ParentElement, PinchEvent, Pixels, Point, Render,
     ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task, TooltipId,
-    TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
+    TouchDragEvent, TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -1753,6 +1753,30 @@ impl HoverListenerMode {
     }
 }
 
+fn begin_drag(
+    listener: DragListener,
+    cursor_offset: Point<Pixels>,
+    cursor_style: Option<CursorStyle>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let view = (listener.render)(listener.value.as_ref(), cursor_offset, window, cx);
+    let external_payload_source = listener.external_payload.map(|external_payload| {
+        let value = listener.value.clone();
+        Box::new(move |window: &mut Window, cx: &mut App| {
+            external_payload(value.as_ref(), window, cx)
+        }) as ExternalDragPayloadSource
+    });
+    cx.active_drag = Some(AnyDrag {
+        view,
+        value: listener.value,
+        cursor_offset,
+        cursor_style,
+        external_payload_source,
+    });
+}
+
+
 pub(crate) struct DragListener {
     value: Arc<dyn Any>,
     render: Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>,
@@ -2967,9 +2991,13 @@ impl Interactivity {
                     }
                 });
 
+                let drag_listener = Rc::new(RefCell::new(drag_listener));
+
                 window.on_mouse_event({
                     let pending_mouse_down = pending_mouse_down.clone();
                     let hitbox = hitbox.clone();
+                    let drag_listener = drag_listener.clone();
+                    let clicked_state = clicked_state.clone();
                     move |event: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture {
                             return;
@@ -2979,36 +3007,54 @@ impl Interactivity {
                         if let Some(mouse_down) = pending_mouse_down.clone()
                             && !cx.has_active_drag()
                             && (event.position - mouse_down.position).magnitude() > DRAG_THRESHOLD
-                            && let Some(listener) = drag_listener.take()
                             && mouse_down.button == MouseButton::Left
+                            && let Some(listener) = drag_listener.borrow_mut().take()
                         {
                             *clicked_state.borrow_mut() = ElementClickedState::default();
-                            let cursor_offset = event.position - hitbox.origin;
-                            let drag = (listener.render)(
-                                listener.value.as_ref(),
-                                cursor_offset,
+                            begin_drag(
+                                listener,
+                                event.position - hitbox.origin,
+                                drag_cursor_style,
                                 window,
                                 cx,
                             );
-                            let external_payload_source =
-                                listener.external_payload.map(|external_payload| {
-                                    let value = listener.value.clone();
-                                    Box::new(move |window: &mut Window, cx: &mut App| {
-                                        external_payload(value.as_ref(), window, cx)
-                                    })
-                                        as ExternalDragPayloadSource
-                                });
-                            cx.active_drag = Some(AnyDrag {
-                                view: drag,
-                                value: listener.value,
-                                cursor_offset,
-                                cursor_style: drag_cursor_style,
-                                external_payload_source,
-                            });
                             pending_mouse_down.take();
                             window.refresh();
                             cx.stop_propagation();
                         }
+                    }
+                });
+
+                // A touch that lands on a draggable element claims the touch drag at once, before
+                // it can become a scroll, so only elements meant to be grabbed (a grip handle)
+                // should carry an `on_drag`.
+                window.on_mouse_event({
+                    let hitbox = hitbox.clone();
+                    let drag_listener = drag_listener.clone();
+                    let clicked_state = clicked_state.clone();
+                    move |event: &TouchDragEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Bubble
+                            || event.phase != TouchPhase::Started
+                            || window.default_prevented()
+                            || cx.has_active_drag()
+                            || !hitbox.is_hovered(window)
+                        {
+                            return;
+                        }
+                        let Some(listener) = drag_listener.borrow_mut().take() else {
+                            return;
+                        };
+                        *clicked_state.borrow_mut() = ElementClickedState::default();
+                        begin_drag(
+                            listener,
+                            event.start_position - hitbox.origin,
+                            drag_cursor_style,
+                            window,
+                            cx,
+                        );
+                        window.prevent_default();
+                        window.refresh();
+                        cx.stop_propagation();
                     }
                 });
 

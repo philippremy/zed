@@ -16,7 +16,8 @@ use gpui::{
     AnyWindowHandle, Bounds, Capslock, DevicePixels, DispatchEventResult, Edges, EditMenuActions,
     GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    Scene, Size, TextInputConfiguration, TextInputStateChange, TouchEvent, TouchId, TouchPhase,
+    MouseExitEvent, MouseMoveEvent, PinchEvent, ScrollDelta, ScrollWheelEvent, Scene, Size,
+    TextInputConfiguration, TextInputStateChange, TouchEvent, TouchId, TouchPhase,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets,
     WindowParams, WindowVisibility, px, size,
 };
@@ -27,7 +28,7 @@ use objc2::{
     ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSNotification, NSNotificationCenter, NSObjectProtocol, NSSet, NSValue};
+use objc2_foundation::{NSArray, NSNotification, NSNotificationCenter, NSObjectProtocol, NSSet, NSValue};
 use objc2_quartz_core::CAMetalLayer;
 use objc2_ui_kit::{
     NSValueUIGeometryExtensions, UIKeyboardFrameEndUserInfoKey,
@@ -36,7 +37,8 @@ use objc2_ui_kit::{
 };
 use objc2_ui_kit::{
     UICoordinateSpace, UIEdgeInsets, UIEditMenuConfiguration, UIEditMenuInteraction, UIEvent,
-    UIScreen, UITouch,
+    UIGestureRecognizerState, UIHoverGestureRecognizer, UIPanGestureRecognizer,
+    UIPinchGestureRecognizer, UIScreen, UIScrollTypeMask, UITouch,
     UITraitCollection, UITraitEnvironment, UIUserInterfaceStyle, UIView, UIViewAutoresizing,
     UIViewController, UIViewLayoutRegion, UIViewLayoutRegionAdaptivityAxis, UIWindow,
     UIWindowScene,
@@ -215,6 +217,36 @@ define_class!(
             }
         }
 
+        #[unsafe(method(handlePinch:))]
+        fn handle_pinch(&self, recognizer: &UIPinchGestureRecognizer) {
+            let position = recognizer_location(recognizer, self);
+            // The scale is cumulative from the gesture's start; resetting it after every event
+            // makes each one carry only its own change, which is what `PinchEvent::delta` is.
+            let delta = recognizer.scale() as f32 - 1.;
+            recognizer.setScale(1.);
+            let phase = gesture_phase(recognizer.state());
+            self.ivars()
+                .with_window(|window| window.dispatch_pinch(position, delta, phase));
+        }
+
+        #[unsafe(method(handleHover:))]
+        fn handle_hover(&self, recognizer: &UIHoverGestureRecognizer) {
+            let position = recognizer_location(recognizer, self);
+            self.ivars()
+                .with_window(|window| window.dispatch_hover(position, recognizer.state()));
+        }
+
+        #[unsafe(method(handleScroll:))]
+        fn handle_scroll(&self, recognizer: &UIPanGestureRecognizer) {
+            let position = recognizer_location(recognizer, self);
+            let translation = recognizer.translationInView(Some(self));
+            recognizer.setTranslation_inView(CGPoint::ZERO, Some(self));
+            let delta = Point::new(px(translation.x as f32), px(translation.y as f32));
+            let phase = gesture_phase(recognizer.state());
+            self.ivars()
+                .with_window(|window| window.dispatch_pointer_scroll(position, delta, phase));
+        }
+
         #[unsafe(method(touchesBegan:withEvent:))]
         fn touches_began(&self, touches: &NSSet<UITouch>, event: Option<&UIEvent>) {
             self.handle_touches(touches, event);
@@ -268,6 +300,39 @@ impl MetalView {
     fn new(frame: CGRect, main_thread: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(main_thread).set_ivars(WindowReference::default());
         unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    /// Pointer input that UIKit does not report as touches: trackpad/mouse hover, two-finger
+    /// scrolling and the pinch gesture (from a trackpad or two fingers).
+    fn install_gesture_recognizers(&self) {
+        // SAFETY: the target is this view, which the gesture recognizers' actions are defined on.
+        unsafe {
+            let pinch = UIPinchGestureRecognizer::initWithTarget_action(
+                UIPinchGestureRecognizer::alloc(self.mtm()),
+                Some(self),
+                Some(sel!(handlePinch:)),
+            );
+            // Recognising a pinch cancels the two touches, so they never end up as a stray tap.
+            pinch.setCancelsTouchesInView(true);
+            self.addGestureRecognizer(&pinch);
+
+            let hover = UIHoverGestureRecognizer::initWithTarget_action(
+                UIHoverGestureRecognizer::alloc(self.mtm()),
+                Some(self),
+                Some(sel!(handleHover:)),
+            );
+            self.addGestureRecognizer(&hover);
+
+            let scroll = UIPanGestureRecognizer::initWithTarget_action(
+                UIPanGestureRecognizer::alloc(self.mtm()),
+                Some(self),
+                Some(sel!(handleScroll:)),
+            );
+            // Scroll events only: finger drags already arrive as touches and are recognised by GPUI.
+            scroll.setAllowedTouchTypes(&NSArray::new());
+            scroll.setAllowedScrollTypesMask(UIScrollTypeMask::All);
+            self.addGestureRecognizer(&scroll);
+            }
     }
 
     fn handle_touches(&self, touches: &NSSet<UITouch>, event: Option<&UIEvent>) {
@@ -393,6 +458,8 @@ impl IosWindow {
             // Enable user interaction on the Metal view for touch handling
             view.setUserInteractionEnabled(true);
             view.setMultipleTouchEnabled(true);
+            view.install_gesture_recognizers();
+            super::pointer::install(&view, main_thread);
 
             view_controller.setView(Some(&view));
 
@@ -532,6 +599,55 @@ impl IosWindowState {
                 None,
                 &hide_block,
             );
+        });
+    }
+
+    pub fn dispatch_pinch(&self, position: Point<Pixels>, delta: f32, phase: TouchPhase) {
+        self.mouse_position.set(position);
+        self.input_callback.with(|callback| {
+            callback(PlatformInput::Pinch(PinchEvent {
+                position,
+                delta,
+                modifiers: self.modifiers.get(),
+                phase,
+            }))
+        });
+    }
+
+    pub fn dispatch_hover(&self, position: Point<Pixels>, state: UIGestureRecognizerState) {
+        self.mouse_position.set(position);
+        if state == UIGestureRecognizerState::Ended || state == UIGestureRecognizerState::Cancelled {
+            self.input_callback.with(|callback| {
+                callback(PlatformInput::MouseExited(MouseExitEvent {
+                    position,
+                    pressed_button: None,
+                    modifiers: self.modifiers.get(),
+                }))
+            });
+            return;
+        }
+        self.input_callback.with(|callback| {
+            callback(PlatformInput::MouseMove(MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers: self.modifiers.get(),
+            }))
+        });
+    }
+
+    pub fn dispatch_pointer_scroll(
+        &self,
+        position: Point<Pixels>,
+        delta: Point<Pixels>,
+        phase: TouchPhase,
+    ) {
+        self.input_callback.with(|callback| {
+            callback(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(delta),
+                modifiers: self.modifiers.get(),
+                touch_phase: phase,
+            }))
         });
     }
 

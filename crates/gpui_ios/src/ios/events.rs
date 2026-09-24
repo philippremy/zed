@@ -1,7 +1,7 @@
 //! Conversion from UIKit events to GPUI input events.
 
 use gpui::{Pixels, Point, TouchId, TouchPhase, px};
-use objc2_ui_kit::{UITouch, UITouchPhase, UIView};
+use objc2_ui_kit::{UIGestureRecognizer, UIGestureRecognizerState, UITouch, UITouchPhase, UIView};
 
 pub fn touch_location_in_view(touch: &UITouch, view: &UIView) -> Point<Pixels> {
     let location = touch.locationInView(Some(view));
@@ -27,4 +27,18 @@ pub fn touch_force(touch: &UITouch) -> Option<f32> {
         return None;
     }
     Some((touch.force() / maximum_force).clamp(0.0, 1.0) as f32)
+}
+
+pub fn recognizer_location(recognizer: &UIGestureRecognizer, view: &UIView) -> Point<Pixels> {
+    let location = recognizer.locationInView(Some(view));
+    Point::new(px(location.x as f32), px(location.y as f32))
+}
+
+pub fn gesture_phase(state: UIGestureRecognizerState) -> TouchPhase {
+    match state {
+        UIGestureRecognizerState::Began => TouchPhase::Started,
+        UIGestureRecognizerState::Changed => TouchPhase::Moved,
+        UIGestureRecognizerState::Ended => TouchPhase::Ended,
+        _ => TouchPhase::Cancelled,
+    }
 }

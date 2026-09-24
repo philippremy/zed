@@ -352,8 +352,8 @@ impl Platform for IosPlatform {
         Ok(app_path.join(name))
     }
 
-    fn set_cursor_style(&self, _style: CursorStyle) {
-        // iOS doesn't have visible cursors (except for Apple Pencil hover on iPad)
+    fn set_cursor_style(&self, style: CursorStyle) {
+        super::pointer::set_cursor_style(style);
     }
 
     fn hide_cursor_until_mouse_moves(&self) {}

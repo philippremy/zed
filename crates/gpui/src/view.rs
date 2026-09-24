@@ -363,6 +363,21 @@ impl ViewDeps {
             || self.modifiers.is_some_and(|m| m != window.modifiers_untracked())
     }
 
+    /// Adds dependencies discovered while painting (an element may read an entity, such as a caret
+    /// blink timer, only at paint time).
+    fn extend(&mut self, cx: &App, entities: &FxHashSet<EntityId>, globals: TypeIdHashSet) {
+        for entity in entities {
+            if !self.entities.iter().any(|(known, _)| known == entity) {
+                self.entities.push((*entity, cx.notify_version(*entity)));
+            }
+        }
+        for global in globals {
+            if self.global_types.insert(global) {
+                self.globals.push((global, cx.global_version(global)));
+            }
+        }
+    }
+
     fn entities_changed(&self, cx: &App) -> bool {
         self.entities.iter().any(|(e, v)| cx.notify_version(*e) != *v)
     }
@@ -782,7 +797,10 @@ fn paint_view(
                     if let Some(element) = element {
                         let refreshing = mem::replace(&mut window.refreshing, true);
                         let outer_input_reads = window.input_reads.replace(0);
-                        element.paint(window, cx);
+                        let ((), painted_entities, painted_globals) =
+                            cx.detect_accessed(|cx| element.paint(window, cx));
+                        element_state.deps.extend(cx, &painted_entities, painted_globals);
+                        element_state.accessed_entities.extend(painted_entities);
                         let inputs = window.input_reads.get();
                         window.input_reads.set(outer_input_reads | inputs);
                         element_state.deps.capture_inputs(window, inputs);

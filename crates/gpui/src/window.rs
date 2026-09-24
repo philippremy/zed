@@ -9537,11 +9537,21 @@ pub(crate) fn diff_summaries(
             ));
         }
         if let Some(index) = cached.iter().zip(fresh).position(|(a, b)| a != b) {
-            let clip = |text: &str| text.chars().take(400).collect::<String>();
+            // Show the text around where the two first differ, not just the start.
+            let (a, b) = (&cached[index], &fresh[index]);
+            let common = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+            let window = |text: &str| {
+                let start = common.saturating_sub(60);
+                format!(
+                    "{}{}",
+                    if start > 0 { "…" } else { "" },
+                    text.chars().skip(start).take(200).collect::<String>()
+                )
+            };
             problems.push(format!(
                 "{category} #{index}: cached {} / fresh {}",
-                clip(&cached[index]),
-                clip(&fresh[index])
+                window(a),
+                window(b)
             ));
         }
     }

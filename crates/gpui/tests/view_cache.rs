@@ -135,6 +135,56 @@ fn cached_view_rerenders_when_an_entity_it_read_is_notified(cx: &mut TestAppCont
     assert_eq!(renders.get(), renders_now, "and is reused again afterwards");
 }
 
+struct PaintReader {
+    source: Entity<Source>,
+    paints: Rc<Cell<usize>>,
+    seen: Rc<Cell<u32>>,
+}
+
+impl Render for PaintReader {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+        let (source, paints, seen) = (self.source.clone(), self.paints.clone(), self.seen.clone());
+        canvas(
+            |_, _, _| {},
+            move |_, _, _, cx| {
+                paints.set(paints.get() + 1);
+                seen.set(source.read(cx).value);
+            },
+        )
+        .size_full()
+    }
+}
+
+/// Reads made only while painting (a caret blink timer, say) are dependencies too.
+#[gpui::test]
+fn cached_view_repaints_when_an_entity_read_only_while_painting_changes(cx: &mut TestAppContext) {
+    let paints = Rc::new(Cell::new(0));
+    let seen = Rc::new(Cell::new(0));
+    let source = cx.new(|_| Source { value: 1 });
+    let window = cx.add_window({
+        let (source, paints, seen) = (source.clone(), paints.clone(), seen.clone());
+        move |_, cx| Root {
+            child: cx.new(|_| PaintReader { source, paints, seen }),
+        }
+    });
+    assert_eq!((paints.get(), seen.get()), (1, 1));
+
+    draw(window, cx);
+    draw(window, cx);
+    assert_eq!(paints.get(), 1, "nothing changed, so the view is reused");
+
+    source.update(cx, |source, cx| {
+        source.value = 2;
+        cx.notify();
+    });
+    draw(window, cx);
+    assert_eq!(seen.get(), 2, "the view paints the new value");
+
+    let paints_now = paints.get();
+    draw(window, cx);
+    assert_eq!(paints.get(), paints_now, "and is reused again afterwards");
+}
+
 // --- globals -------------------------------------------------------------------------------
 
 struct Theme(u32);

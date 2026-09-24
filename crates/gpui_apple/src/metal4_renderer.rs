@@ -11,9 +11,13 @@
 //! `PrimitiveBatch::SubpixelSprites { .. } => unreachable!()`, i.e. gpui
 //! doesn't currently produce that primitive in practice at this revision —
 //! not a gap relative to the real renderer, just matching its actual scope.
-//! See `draw()`'s doc comment for the exact current scope and its
-//! remaining, deliberate simplifications (fixed draw order rather than
-//! real scene z-order, chief among them).
+//! See `draw()`'s doc comment for the exact current scope and its one
+//! remaining, deliberate simplification (composited paths can double-blend
+//! an overlapping region — see `draw_paths_from_intermediate`). Draw order
+//! follows `scene.batches()` — the same painter's-algorithm batching
+//! `MetalRenderer::draw_primitives_to_texture` uses — so cross-type z-order
+//! (e.g. text painted over a quad that's above it in the scene) is correct,
+//! not just within-type order.
 //!
 //! Ported from `metal_renderer.rs`'s device/layer setup (unchanged — Metal 4
 //! doesn't touch `CAMetalLayer`/drawable acquisition at all) but the
@@ -29,17 +33,26 @@
 //! bind-point indices are the same binding namespace from the shader's
 //! perspective, only how the CPU side populates slot N differs. Each
 //! primitive kind gets its own pipeline (`compile_pipeline`) and its own
-//! growable instance buffer, but all of them reuse the same three
+//! growable instance buffer — every one of them sub-allocated from a single
+//! `instance_heap` (see its field doc comment) rather than standalone
+//! `MTLBuffer`s, so growing one is just a fresh sub-allocation with no
+//! per-buffer residency-set churn — but all of them reuse the same three
 //! argument-table indices (0=unit vertices, 1=primitive data, 2=viewport
 //! size) one draw call at a time — `QuadInputIndex`/`UnderlineInputIndex`/
 //! etc. all share that exact numeric layout in the shader source.
 //!
-//! Deliberately simplified vs. a production implementation: one command
-//! allocator and one command buffer, fully serialized (each frame waits for
-//! the GPU to finish before the next begins, via an `MTLSharedEvent`) rather
-//! than Apple's recommended triple-buffered allocator rotation. That
-//! sacrifices pipelining for far less state to get wrong in a first,
-//! correctness-focused milestone — see `draw()`.
+//! `FRAME_SLOTS`-way triple buffering (Apple's recommended pattern):
+//! `FRAME_SLOTS` allocators, command buffers, and copies of every
+//! CPU-written-then-GPU-read instance buffer rotate round-robin by frame
+//! number, so encoding frame N+1 can start on the CPU while frame N is
+//! still executing on the GPU — see `draw()`, `allocators`, and
+//! `command_buffers`. Earlier revisions of this renderer used a single
+//! allocator/command-buffer/instance-buffer set, fully serialized (each
+//! frame blocked on the GPU finishing before the next began, via an
+//! `MTLSharedEvent`) — correctness-focused, deliberately non-pipelined,
+//! and superseded by the triple-buffered version once its extra
+//! bookkeeping (see `write_full`'s doc comment for the specific bug that
+//! bookkeeping exists to prevent) was worth taking on.
 //!
 //! Verified against Apple's own "Drawing a Triangle with Metal 4" sample
 //! (`Metal4Renderer.m` / `+Setup.m` / `+Compilation.m` / `+Encoding.m`) for
@@ -47,7 +60,10 @@
 //! command-buffer reuse via `beginCommandBufferWithAllocator:` after commit,
 //! queue-level (not command-buffer-level) residency via `addResidencySet:`,
 //! and the drawable present choreography (`waitForDrawable:` before commit,
-//! `signalDrawable:` after commit, then `[drawable present]`).
+//! `signalDrawable:` after commit, then `[drawable present]`). This
+//! renderer diverges from the sample in one place — see
+//! `command_buffers`'s doc comment for why each frame slot gets its own
+//! command buffer object rather than sharing the sample's single one.
 
 use crate::metal_atlas::MetalAtlas;
 use crate::metal_renderer::{PathRasterizationVertex, PathSprite, SurfaceBounds};
@@ -58,9 +74,14 @@ use core_video::{
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use gpui::{
-    DevicePixels, MonochromeSprite, PaintSurface, Path, PolychromeSprite, Quad, ScaledPixels,
-    Scene, Shadow, Size, Underline,
+    DevicePixels, MonochromeSprite, PaintSurface, Path, PolychromeSprite, PrimitiveBatch, Quad,
+    ScaledPixels, Scene, Size,
 };
+// Only referenced by name in the `#[cfg(test)]` fixtures further down this
+// file — `draw_shadows`/`draw_underlines` themselves take a `Range<usize>`
+// into an already-written buffer, not a `&[Shadow]`/`&[Underline]` slice.
+#[cfg(test)]
+use gpui::{Shadow, Underline};
 use objc::{msg_send, sel, sel_impl};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -68,13 +89,15 @@ use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4BlendState, MTL4CommandAllocator,
     MTL4CommandBuffer, MTL4CommandEncoder, MTL4CommandQueue, MTL4Compiler, MTL4CompilerDescriptor,
     MTL4LibraryFunctionDescriptor, MTL4RenderCommandEncoder, MTL4RenderPassDescriptor,
-    MTL4RenderPipelineDescriptor, MTLBuffer, MTLClearColor, MTLDevice, MTLLoadAction,
-    MTLPixelFormat, MTLPrimitiveType, MTLRenderPipelineState, MTLRenderStages, MTLResidencySet,
-    MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent, MTLStoreAction, MTLTexture,
+    MTL4RenderPipelineDescriptor, MTLBuffer, MTLClearColor, MTLDevice, MTLHeap, MTLHeapDescriptor,
+    MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLRenderPipelineState, MTLRenderStages,
+    MTLResidencySet, MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent, MTLStorageMode,
+    MTLStoreAction, MTLTexture,
 };
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::mem;
+use std::ops::Range;
 use std::ptr::NonNull;
 
 /// Bridges a raw pointer from the legacy `metal`/`objc` crates (both of
@@ -96,6 +119,16 @@ unsafe fn bridge_retain_autoreleased<T: objc2::Message>(ptr: *mut c_void) -> Ret
     unsafe { Retained::retain_autoreleased(ptr) }.expect("bridged Objective-C pointer was nil")
 }
 
+/// Number of in-flight frame slots — Apple's recommended triple buffering,
+/// see the module doc comment. Each slot owns its own `MTL4CommandAllocator`
+/// and `MTL4CommandBuffer` pair, and its own copy of every
+/// CPU-written-then-GPU-read instance buffer (`quads_buffer`,
+/// `viewport_size_buffer`, etc. — see `draw()`'s doc comment for exactly
+/// which fields and why). `argument_table` is the one exception — *not*
+/// per-slot, see its own doc comment for why sharing it across overlapping
+/// frames is safe.
+const FRAME_SLOTS: usize = 3;
+
 const MAX_QUADS_PER_FRAME_INITIAL: usize = 256;
 /// Same reasoning as `metal_renderer.rs`'s own `PATH_SAMPLE_COUNT` (not
 /// reused directly — that constant is private to that file, and this is a
@@ -108,6 +141,20 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// sized as "a few dozen small paths' worth" rather than mirroring
 /// `MAX_QUADS_PER_FRAME_INITIAL` 1:1 the way the other instance buffers do.
 const MAX_PATH_VERTICES_INITIAL: usize = 3 * 256;
+/// Initial slot count for `atlas_size_buffer` — like every other instance
+/// buffer's `_INITIAL` constant, just a starting point; `draw_batches`
+/// grows it (once per frame, before the batch loop — see `ensure_capacity`)
+/// to fit however many distinct sprite-atlas sizes this *particular* frame
+/// actually needs, with no fixed ceiling.
+const ATLAS_SIZE_SLOTS_INITIAL: usize = 8;
+/// Starting size of `instance_heap` — same 2 MB default `MetalRenderer`'s own
+/// `InstanceBufferPool` uses (see `metal_renderer.rs`), comfortably larger
+/// than every `_INITIAL` buffer size above summed together (a few hundred
+/// KB at most), leaving headroom to grow several times over before
+/// `Self::new_buffer`'s fallback path (a standalone, individually
+/// residency-tracked buffer, for when the heap is genuinely out of room)
+/// ever has to engage in practice.
+const INSTANCE_HEAP_INITIAL_SIZE: usize = 2 * 1024 * 1024;
 
 /// Bit-for-bit layout of the shader's `Size_DevicePixels` (cbindgen-generated
 /// from `gpui::Size<DevicePixels>`, itself two `i32`s) — **not** `f32`. Using
@@ -137,13 +184,67 @@ pub struct Metal4Renderer {
 
     mtl4_device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTL4CommandQueue>>,
-    command_buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
-    allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
+    /// `FRAME_SLOTS`-way round-robin, paired one-to-one with `allocators`
+    /// (same slot index, same lifecycle). `MTL4CommandBuffer::
+    /// beginCommandBufferWithAllocator:`'s own doc comment only documents
+    /// the *allocator* as safe to reuse right after `endCommandBuffer`
+    /// ("You can safely reuse command allocators after ending the command
+    /// buffer using it by calling endCommandBuffer") — it says nothing
+    /// about whether the *command buffer object itself* may safely be
+    /// re-begun before its own prior submission has finished executing on
+    /// the GPU. Rather than assume that's fine, each slot gets its own
+    /// command buffer object and only touches it again once `draw()` has
+    /// already confirmed (via `shared_event`) that slot's last use
+    /// completed — the same wait `allocators`' `reset()` needs anyway, so
+    /// this costs nothing extra and removes the ambiguity entirely. (The
+    /// original single-command-buffer version of this renderer relied on
+    /// the *allocator*-reuse guarantee alone, safely, only because it also
+    /// fully serialized every frame behind a GPU-completion wait — a
+    /// stronger condition than the allocator's contract actually needs.)
+    command_buffers: [Retained<ProtocolObject<dyn MTL4CommandBuffer>>; FRAME_SLOTS],
+    /// `FRAME_SLOTS`-way round-robin, one allocator per in-flight frame.
+    /// `frame_number % FRAME_SLOTS` (via `current_slot`) picks which one
+    /// `draw()`/`render_scene_to_image()` binds to that same-indexed
+    /// `command_buffers` slot this frame. `MTL4CommandAllocator::reset()`'s
+    /// own doc comment: "You are responsible to ensure that all command
+    /// buffers with memory originating from this allocator instance are
+    /// complete before [resetting] it" — `draw()` only resets a slot's
+    /// allocator after confirming (via `shared_event`) that the *last*
+    /// frame which used that slot (`frame_number - FRAME_SLOTS` frames ago)
+    /// has finished on the GPU. With one allocator this meant waiting for
+    /// the *previous* frame every time (full CPU/GPU serialization, the
+    /// simplification this renderer shipped with initially); with
+    /// `FRAME_SLOTS` of them, encoding frame N+1 can start while frame N is
+    /// still executing, since they use different allocators — the actual
+    /// point of triple buffering.
+    allocators: [Retained<ProtocolObject<dyn MTL4CommandAllocator>>; FRAME_SLOTS],
+    /// Shared across every slot/frame, unlike the instance buffers below —
+    /// safe because `setArgumentTable_atStages` captures the table's
+    /// *current* bindings into that specific draw call at encode time (not
+    /// a live pointer the GPU re-reads later): every `draw_*` method here
+    /// already calls `setAddress_atIndex` + `setArgumentTable_atStages`
+    /// fresh, immediately before its own `drawPrimitives`, and did so
+    /// safely even when multiple draw calls of *different* primitive kinds
+    /// shared this same table within one frame, before `FRAME_SLOTS` even
+    /// existed — the same reasoning extends unchanged across frames.
     argument_table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
     /// Long-lived residency set for everything except the drawable itself
     /// (the drawable's own residency is `CAMetalLayer.residencySet`, added
     /// to the queue separately in `new` — see the doc comment up top).
     residency_set: Retained<ProtocolObject<dyn MTLResidencySet>>,
+    /// Backs every renderer-owned `MTLBuffer` (`unit_vertices`,
+    /// `viewport_size_buffer`, and every field below sub-allocates from
+    /// this via `Self::new_buffer`) — added to `residency_set` exactly
+    /// once, here, in `new_internal`. `MTLHeap: MTLAllocation`, so
+    /// everything sub-allocated from a resident heap is itself
+    /// automatically resident; no buffer growth anywhere in this renderer
+    /// needs its own `addAllocation`/`removeAllocation`/`commit`/
+    /// `requestResidency` call any more, unlike before this field existed.
+    /// `Self::new_buffer` falls back to a standalone, individually-tracked
+    /// buffer on the rare frame that exhausts it (see
+    /// `INSTANCE_HEAP_INITIAL_SIZE`) — this renderer still has no hard
+    /// buffer-size ceiling, the heap just makes the common case cheaper.
+    instance_heap: Retained<ProtocolObject<dyn MTLHeap>>,
     quad_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     underline_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     shadow_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
@@ -157,32 +258,93 @@ pub struct Metal4Renderer {
     /// GPU-texture cache, not something this renderer manages itself; kept
     /// alive for the renderer's whole lifetime like `MetalRenderer`'s own.
     core_video_texture_cache: CVMetalTextureCache,
+    /// Never written after construction (the constant unit quad), so —
+    /// unlike every buffer below — it needs no per-slot copy: there's
+    /// nothing for an overlapping frame to race against.
     unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
-    viewport_size_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-    /// Written by `draw_monochrome_sprites`/`draw_polychrome_sprites` right
-    /// before it's read — same one-buffer-reused-per-draw-call approach as
-    /// `viewport_size_buffer`.
-    atlas_size_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-    /// Reallocated (and re-added to the residency set) whenever a frame
-    /// needs more quads than the current capacity.
-    quads_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
+    /// One copy per frame slot (see `current_slot`) — unlike
+    /// `argument_table`, this buffer's *contents* are read live by the GPU
+    /// (a raw pointer dereference in the shader), not captured at encode
+    /// time, and unlike `unit_vertices` its value genuinely can change
+    /// frame to frame (a resize). With triple buffering, frame N+1 can
+    /// start encoding — and writing a new viewport size — while frame N is
+    /// still executing on the GPU; a single shared buffer would let frame
+    /// N+1's write reach frame N's still-in-flight draw calls before they
+    /// run, corrupting frame N's viewport. See `draw()`'s doc comment for
+    /// the general rule this and every buffer below follow.
+    viewport_size_buffer: [Retained<ProtocolObject<dyn MTLBuffer>>; FRAME_SLOTS],
+    /// One `ViewportSize`-sized slot per sprite-batch draw call this frame
+    /// (see `atlas_size_cursor`), grown like every other instance buffer —
+    /// unlike `viewport_size_buffer`'s old single-buffer self, which used to
+    /// be safe to blindly overwrite because every draw call in a frame
+    /// wrote the *same* value to it, a sprite batch's atlas size genuinely
+    /// differs from another sprite batch's in the same frame whenever they
+    /// sample different atlas textures (`scene.batches()` splits
+    /// `MonochromeSprites`/`PolychromeSprites` by `texture_id` exactly when
+    /// that happens). Per-slot for the same cross-frame reason
+    /// `viewport_size_buffer` is. Also used, unslotted (always its element
+    /// 0 of the current frame slot), by `draw_surfaces` for a video frame's
+    /// texture size — a separate, pre-existing, narrower simplification
+    /// (`draw_surfaces` writes one `SurfaceBounds`/one atlas size per
+    /// surface in an internal loop, so 2+ `PaintSurface`s in one frame — or
+    /// a frame with both surfaces and sprites — can race the same way; see
+    /// `draw_surfaces`'s own doc comment. Not fixed here: this app never
+    /// paints a `PaintSurface`).
+    atlas_size_buffer: [RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>; FRAME_SLOTS],
+    /// Next free element index into the *current slot's*
+    /// `atlas_size_buffer` — reset to 0 at the top of every `draw_batches`
+    /// call, bumped by one per `draw_monochrome_sprites`/
+    /// `draw_polychrome_sprites` call. Not itself per-slot: it's transient,
+    /// scoped to "this frame's encoding" and reset unconditionally
+    /// regardless of which slot that encoding targets.
+    atlas_size_cursor: Cell<usize>,
+    /// One copy per frame slot — reallocated (sub-allocated fresh from
+    /// `instance_heap` — see its field doc comment — no residency-set
+    /// bookkeeping needed) whenever a frame needs more quads than that
+    /// slot's current capacity. See `draw()`'s doc comment for why every
+    /// instance buffer needs `FRAME_SLOTS` copies once frame N+1's CPU
+    /// encoding can overlap frame N's GPU execution.
+    quads_buffer: [RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>; FRAME_SLOTS],
     /// Same growth strategy as `quads_buffer`, for `gpui::Underline`s.
-    underlines_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
+    underlines_buffer: [RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>; FRAME_SLOTS],
     /// Same growth strategy as `quads_buffer`, for `gpui::Shadow`s.
-    shadows_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
+    shadows_buffer: [RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>; FRAME_SLOTS],
     /// Same growth strategy as `quads_buffer`, for `gpui::MonochromeSprite`s.
-    monochrome_sprites_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
+    monochrome_sprites_buffer:
+        [RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>; FRAME_SLOTS],
     /// Same growth strategy as `quads_buffer`, for `gpui::PolychromeSprite`s.
-    polychrome_sprites_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
-    /// Flattened `PathRasterizationVertex`es for every path in the scene —
-    /// not instanced like the other buffers (each vertex is one corner of
-    /// one triangle, drawn with a plain, non-instanced `drawPrimitives`),
-    /// so "growth" here means "more total vertices across all paths," not
-    /// "more instances."
-    path_vertices_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
-    /// One `PathSprite` (just a `Bounds`) per path, used only by the
-    /// compositing pass — see `draw_paths_from_intermediate`.
-    path_sprites_buffer: RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
+    polychrome_sprites_buffer:
+        [RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>; FRAME_SLOTS],
+    /// One copy per frame slot. Flattened `PathRasterizationVertex`es — not
+    /// for one path batch, but bump-allocated across *every* `Paths` batch
+    /// in the frame (see `path_vertices_cursor`): `draw_batches` pre-grows
+    /// the current slot's buffer to the whole scene's total vertex count
+    /// before the batch loop starts (from `scene.paths`, summed across
+    /// every path, not just one batch), so a second `Paths` batch's
+    /// rasterization never has to reallocate — which would free the buffer
+    /// a first batch's already-encoded-but-not-yet-GPU-executed
+    /// rasterization draw this same frame still points at (see
+    /// `draw_batches`'s doc comment). Not instanced like the other buffers
+    /// (each vertex is one corner of one triangle, drawn with a plain,
+    /// non-instanced `drawPrimitives`, offset via `vertexStart` instead of
+    /// `baseInstance`).
+    path_vertices_buffer: [RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>; FRAME_SLOTS],
+    /// Next free element index into the current slot's `path_vertices_buffer`
+    /// — reset to 0 at the top of every `draw_batches` call, advanced by
+    /// each `Paths` batch's vertex count. Not per-slot itself, same
+    /// reasoning as `atlas_size_cursor`.
+    path_vertices_cursor: Cell<usize>,
+    /// One copy per frame slot. One `PathSprite` (just a `Bounds`) per
+    /// path, used only by the compositing pass — see
+    /// `draw_paths_from_intermediate`. Same bump-allocated-across-the-
+    /// whole-frame treatment as `path_vertices_buffer`, pre-grown to
+    /// `scene.paths.len()`.
+    path_sprites_buffer: [RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>; FRAME_SLOTS],
+    /// Next free element index into the current slot's `path_sprites_buffer`
+    /// — reset to 0 at the top of every `draw_batches` call, advanced by
+    /// each `Paths` batch's path count. Not per-slot itself, same reasoning
+    /// as `atlas_size_cursor`.
+    path_sprites_cursor: Cell<usize>,
     /// Full-viewport-sized, rebuilt on resize (`draw_paths_to_intermediate`
     /// checks the size itself, lazily, only when there's a path to
     /// rasterize — unlike `MetalRenderer`, which always keeps this current
@@ -223,10 +385,20 @@ pub struct Metal4Renderer {
     /// is additive — a redundant `addAllocation` of an already-resident
     /// texture is harmless).
     resident_atlas_texture: Cell<Option<gpui::AtlasTextureId>>,
-    /// Serializes frames: signalled after each commit, waited on before the
-    /// next frame reuses the (sole) allocator/command buffer/quads buffer.
+    /// Signalled with `frame_number` after each commit. `draw()`/
+    /// `render_scene_to_image()` wait on it — not for the *previous* frame
+    /// any more (that was the single-allocator simplification), but for
+    /// `frame_number - FRAME_SLOTS`: the last frame that used the *same*
+    /// allocator/instance-buffer slot this frame is about to reuse. See
+    /// `allocators`'s doc comment.
     shared_event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     frame_number: Cell<u64>,
+    /// `(frame_number - 1) % FRAME_SLOTS` (frame numbers start at 1) —
+    /// computed once per frame, right after `frame_number` is bumped, and
+    /// read by every method that indexes a per-slot field (`quads_buffer`
+    /// and friends) so the frame's own slot doesn't have to be threaded
+    /// through every one of their call signatures.
+    current_slot: Cell<usize>,
 }
 
 impl Metal4Renderer {
@@ -274,12 +446,7 @@ impl Metal4Renderer {
         }
     }
 
-    fn new_internal(
-        device: metal::Device,
-        layer: Option<metal::MetalLayer>,
-        opaque: bool,
-    ) -> Self {
-
+    fn new_internal(device: metal::Device, layer: Option<metal::MetalLayer>, opaque: bool) -> Self {
         // SAFETY: `device`'s raw pointer is a live, retained `id<MTLDevice>`
         // for as long as `device` itself is alive; we take our own retain on
         // it below and hold it for the renderer's whole lifetime.
@@ -292,72 +459,106 @@ impl Metal4Renderer {
         let queue = mtl4_device
             .newMTL4CommandQueue()
             .expect("metal4: device could not create an MTL4CommandQueue");
-        let command_buffer = mtl4_device
-            .newCommandBuffer()
-            .expect("metal4: device could not create an MTL4CommandBuffer");
-        let allocator = mtl4_device
-            .newCommandAllocator()
-            .expect("metal4: device could not create an MTL4CommandAllocator");
+        let command_buffers: [Retained<ProtocolObject<dyn MTL4CommandBuffer>>; FRAME_SLOTS] =
+            std::array::from_fn(|_| {
+                mtl4_device
+                    .newCommandBuffer()
+                    .expect("metal4: device could not create an MTL4CommandBuffer")
+            });
+        let allocators: [Retained<ProtocolObject<dyn MTL4CommandAllocator>>; FRAME_SLOTS] =
+            std::array::from_fn(|_| {
+                mtl4_device
+                    .newCommandAllocator()
+                    .expect("metal4: device could not create an MTL4CommandAllocator")
+            });
 
         let argument_table = {
-            let descriptor = unsafe { MTL4ArgumentTableDescriptor::new() };
+            let descriptor = MTL4ArgumentTableDescriptor::new();
             // Buffer indices 0..=3 (unit vertices, primitive data, viewport
             // size, atlas texture size — see `SpriteInputIndex` in
             // shaders.metal) and texture index 4 (the atlas texture
             // itself). Buffers and textures are separate lists within one
             // argument table, same as classic Metal's separate
             // setVertexBuffer:/setVertexTexture: namespaces.
-            unsafe { descriptor.setMaxBufferBindCount(4) };
-            unsafe { descriptor.setMaxTextureBindCount(5) };
+            descriptor.setMaxBufferBindCount(4);
+            descriptor.setMaxTextureBindCount(5);
             mtl4_device
                 .newArgumentTableWithDescriptor_error(&descriptor)
                 .expect("metal4: device could not create an MTL4ArgumentTable")
         };
 
         let residency_set = {
-            let descriptor = unsafe { MTLResidencySetDescriptor::new() };
+            let descriptor = MTLResidencySetDescriptor::new();
             mtl4_device
                 .newResidencySetWithDescriptor_error(&descriptor)
                 .expect("metal4: device could not create an MTLResidencySet")
         };
 
+        // Every renderer-owned `MTLBuffer` sub-allocates from this — see
+        // `instance_heap`'s field doc comment. `StorageModeShared` since
+        // this renderer only ever writes buffer contents via a CPU pointer
+        // (`contents()`), never a blit; every `Self::new_buffer` call below
+        // matches this with its own `options` argument, as heap-buffer
+        // creation requires (a mismatched storage/cache mode is a
+        // programmer error `newBufferWithLength:options:` documents as
+        // producing `nil`, not UB — but silently, so it's still on us to
+        // keep them in sync).
+        let instance_heap = {
+            let descriptor = MTLHeapDescriptor::new();
+            descriptor.setSize(INSTANCE_HEAP_INITIAL_SIZE);
+            descriptor.setStorageMode(MTLStorageMode::Shared);
+            mtl4_device
+                .newHeapWithDescriptor(&descriptor)
+                .expect("metal4: device could not create an MTLHeap")
+        };
+        {
+            residency_set.addAllocation(instance_heap.as_ref());
+            residency_set.commit();
+            residency_set.requestResidency();
+        }
+
         let shared_event = mtl4_device
             .newSharedEvent()
             .expect("metal4: device could not create an MTLSharedEvent");
-        unsafe { shared_event.setSignaledValue(0) };
+        shared_event.setSignaledValue(0);
 
         // The unit quad (two triangles covering [0,1]x[0,1]) — identical
         // data/layout to MetalRenderer's `unit_vertices`, just written
         // through objc2-metal instead of the legacy `metal` crate.
-        let unit_vertices_data: [[f32; 2]; 6] = [
-            [0., 0.],
-            [1., 0.],
-            [0., 1.],
-            [0., 1.],
-            [1., 0.],
-            [1., 1.],
-        ];
+        let unit_vertices_data: [[f32; 2]; 6] =
+            [[0., 0.], [1., 0.], [0., 1.], [0., 1.], [1., 0.], [1., 1.]];
         let unit_vertices = Self::new_buffer_with_data(
             &mtl4_device,
+            &instance_heap,
+            &residency_set,
             unit_vertices_data.as_ptr() as *const c_void,
             mem::size_of_val(&unit_vertices_data),
         );
 
-        let viewport_size_buffer = Self::new_buffer(&mtl4_device, mem::size_of::<ViewportSize>());
+        let viewport_size_buffer: [Retained<ProtocolObject<dyn MTLBuffer>>; FRAME_SLOTS] =
+            std::array::from_fn(|_| {
+                Self::new_buffer(
+                    &mtl4_device,
+                    &instance_heap,
+                    &residency_set,
+                    mem::size_of::<ViewportSize>(),
+                )
+            });
 
-        let quads_buffer = Self::new_buffer(
-            &mtl4_device,
-            mem::size_of::<Quad>() * MAX_QUADS_PER_FRAME_INITIAL,
-        );
+        let quads_buffer: [RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>; FRAME_SLOTS] =
+            std::array::from_fn(|_| {
+                RefCell::new((
+                    Self::new_buffer(
+                        &mtl4_device,
+                        &instance_heap,
+                        &residency_set,
+                        mem::size_of::<Quad>() * MAX_QUADS_PER_FRAME_INITIAL,
+                    ),
+                    MAX_QUADS_PER_FRAME_INITIAL,
+                ))
+            });
 
-        unsafe {
-            residency_set.addAllocation(unit_vertices.as_ref());
-            residency_set.addAllocation(viewport_size_buffer.as_ref());
-            residency_set.addAllocation(quads_buffer.as_ref());
-            residency_set.commit();
-            residency_set.requestResidency();
-        }
-        unsafe { queue.addResidencySet(&residency_set) };
+        queue.addResidencySet(&residency_set);
 
         // The drawable's own texture needs to be resident too, via the
         // layer's own residency set — a real, separate `MTLResidencySet`
@@ -367,12 +568,11 @@ impl Metal4Renderer {
         // binding for this new property, so it's fetched via a raw
         // `objc` message send and bridged the same way as the device above.
         if let Some(layer) = &layer {
-            let layer_residency_set_ptr: *mut c_void =
-                unsafe { msg_send![&**layer, residencySet] };
+            let layer_residency_set_ptr: *mut c_void = unsafe { msg_send![&**layer, residencySet] };
             if !layer_residency_set_ptr.is_null() {
                 let layer_residency_set: Retained<ProtocolObject<dyn MTLResidencySet>> =
                     unsafe { bridge_retain_autoreleased(layer_residency_set_ptr) };
-                unsafe { queue.addResidencySet(&layer_residency_set) };
+                queue.addResidencySet(&layer_residency_set);
             } else {
                 log::warn!(
                     "metal4: CAMetalLayer.residencySet was nil — the drawable's own texture may not be resident"
@@ -380,85 +580,112 @@ impl Metal4Renderer {
             }
         }
 
-        let underlines_buffer = Self::new_buffer(
-            &mtl4_device,
-            mem::size_of::<gpui::Underline>() * MAX_QUADS_PER_FRAME_INITIAL,
-        );
-        unsafe {
-            residency_set.addAllocation(underlines_buffer.as_ref());
-            residency_set.commit();
-            residency_set.requestResidency();
-        }
+        let underlines_buffer: [RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>;
+            FRAME_SLOTS] = std::array::from_fn(|_| {
+            RefCell::new((
+                Self::new_buffer(
+                    &mtl4_device,
+                    &instance_heap,
+                    &residency_set,
+                    mem::size_of::<gpui::Underline>() * MAX_QUADS_PER_FRAME_INITIAL,
+                ),
+                MAX_QUADS_PER_FRAME_INITIAL,
+            ))
+        });
 
-        let shadows_buffer = Self::new_buffer(
-            &mtl4_device,
-            mem::size_of::<gpui::Shadow>() * MAX_QUADS_PER_FRAME_INITIAL,
-        );
-        unsafe {
-            residency_set.addAllocation(shadows_buffer.as_ref());
-            residency_set.commit();
-            residency_set.requestResidency();
-        }
+        let shadows_buffer: [RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>;
+            FRAME_SLOTS] = std::array::from_fn(|_| {
+            RefCell::new((
+                Self::new_buffer(
+                    &mtl4_device,
+                    &instance_heap,
+                    &residency_set,
+                    mem::size_of::<gpui::Shadow>() * MAX_QUADS_PER_FRAME_INITIAL,
+                ),
+                MAX_QUADS_PER_FRAME_INITIAL,
+            ))
+        });
 
-        let monochrome_sprites_buffer = Self::new_buffer(
-            &mtl4_device,
-            mem::size_of::<MonochromeSprite>() * MAX_QUADS_PER_FRAME_INITIAL,
-        );
-        unsafe {
-            residency_set.addAllocation(monochrome_sprites_buffer.as_ref());
-            residency_set.commit();
-            residency_set.requestResidency();
-        }
+        let monochrome_sprites_buffer: [RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>;
+            FRAME_SLOTS] = std::array::from_fn(|_| {
+            RefCell::new((
+                Self::new_buffer(
+                    &mtl4_device,
+                    &instance_heap,
+                    &residency_set,
+                    mem::size_of::<MonochromeSprite>() * MAX_QUADS_PER_FRAME_INITIAL,
+                ),
+                MAX_QUADS_PER_FRAME_INITIAL,
+            ))
+        });
 
-        let polychrome_sprites_buffer = Self::new_buffer(
-            &mtl4_device,
-            mem::size_of::<PolychromeSprite>() * MAX_QUADS_PER_FRAME_INITIAL,
-        );
-        unsafe {
-            residency_set.addAllocation(polychrome_sprites_buffer.as_ref());
-            residency_set.commit();
-            residency_set.requestResidency();
-        }
+        let polychrome_sprites_buffer: [RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>;
+            FRAME_SLOTS] = std::array::from_fn(|_| {
+            RefCell::new((
+                Self::new_buffer(
+                    &mtl4_device,
+                    &instance_heap,
+                    &residency_set,
+                    mem::size_of::<PolychromeSprite>() * MAX_QUADS_PER_FRAME_INITIAL,
+                ),
+                MAX_QUADS_PER_FRAME_INITIAL,
+            ))
+        });
 
-        let path_vertices_buffer = Self::new_buffer(
-            &mtl4_device,
-            mem::size_of::<PathRasterizationVertex>() * MAX_PATH_VERTICES_INITIAL,
-        );
-        unsafe {
-            residency_set.addAllocation(path_vertices_buffer.as_ref());
-            residency_set.commit();
-            residency_set.requestResidency();
-        }
+        let path_vertices_buffer: [RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>;
+            FRAME_SLOTS] = std::array::from_fn(|_| {
+            RefCell::new((
+                Self::new_buffer(
+                    &mtl4_device,
+                    &instance_heap,
+                    &residency_set,
+                    mem::size_of::<PathRasterizationVertex>() * MAX_PATH_VERTICES_INITIAL,
+                ),
+                MAX_PATH_VERTICES_INITIAL,
+            ))
+        });
 
-        let path_sprites_buffer = Self::new_buffer(
-            &mtl4_device,
-            mem::size_of::<PathSprite>() * MAX_QUADS_PER_FRAME_INITIAL,
-        );
-        unsafe {
-            residency_set.addAllocation(path_sprites_buffer.as_ref());
-            residency_set.commit();
-            residency_set.requestResidency();
-        }
+        let path_sprites_buffer: [RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>;
+            FRAME_SLOTS] = std::array::from_fn(|_| {
+            RefCell::new((
+                Self::new_buffer(
+                    &mtl4_device,
+                    &instance_heap,
+                    &residency_set,
+                    mem::size_of::<PathSprite>() * MAX_QUADS_PER_FRAME_INITIAL,
+                ),
+                MAX_QUADS_PER_FRAME_INITIAL,
+            ))
+        });
 
-        let surfaces_buffer = Self::new_buffer(&mtl4_device, mem::size_of::<SurfaceBounds>());
-        unsafe {
-            residency_set.addAllocation(surfaces_buffer.as_ref());
-            residency_set.commit();
-            residency_set.requestResidency();
-        }
+        // Not per-slot — see its field doc comment (the pre-existing,
+        // out-of-scope internal-loop simplification `draw_surfaces` already
+        // has makes a second buffering axis here moot in practice).
+        let surfaces_buffer = Self::new_buffer(
+            &mtl4_device,
+            &instance_heap,
+            &residency_set,
+            mem::size_of::<SurfaceBounds>(),
+        );
         let core_video_texture_cache = CVMetalTextureCache::new(None, device.clone(), None)
             .expect("metal4: could not create a CVMetalTextureCache");
 
-        let atlas_size_buffer = Self::new_buffer(&mtl4_device, mem::size_of::<ViewportSize>());
-        unsafe {
-            residency_set.addAllocation(atlas_size_buffer.as_ref());
-            residency_set.commit();
-            residency_set.requestResidency();
-        }
+        let atlas_size_buffer: [RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>;
+            FRAME_SLOTS] = std::array::from_fn(|_| {
+            RefCell::new((
+                Self::new_buffer(
+                    &mtl4_device,
+                    &instance_heap,
+                    &residency_set,
+                    mem::size_of::<ViewportSize>() * ATLAS_SIZE_SLOTS_INITIAL,
+                ),
+                ATLAS_SIZE_SLOTS_INITIAL,
+            ))
+        });
 
         let library = Self::load_shader_library(&device);
         let compiler = {
-            let descriptor = unsafe { MTL4CompilerDescriptor::new() };
+            let descriptor = MTL4CompilerDescriptor::new();
             mtl4_device
                 .newCompilerWithDescriptor_error(&descriptor)
                 .expect("metal4: device could not create an MTL4Compiler")
@@ -498,10 +725,11 @@ impl Metal4Renderer {
             sprite_atlas,
             mtl4_device,
             queue,
-            command_buffer,
-            allocator,
+            command_buffers,
+            allocators,
             argument_table,
             residency_set,
+            instance_heap,
             quad_pipeline_state,
             underline_pipeline_state,
             shadow_pipeline_state,
@@ -514,19 +742,16 @@ impl Metal4Renderer {
             unit_vertices,
             viewport_size_buffer,
             atlas_size_buffer,
-            quads_buffer: RefCell::new((quads_buffer, MAX_QUADS_PER_FRAME_INITIAL)),
-            underlines_buffer: RefCell::new((underlines_buffer, MAX_QUADS_PER_FRAME_INITIAL)),
-            shadows_buffer: RefCell::new((shadows_buffer, MAX_QUADS_PER_FRAME_INITIAL)),
-            monochrome_sprites_buffer: RefCell::new((
-                monochrome_sprites_buffer,
-                MAX_QUADS_PER_FRAME_INITIAL,
-            )),
-            polychrome_sprites_buffer: RefCell::new((
-                polychrome_sprites_buffer,
-                MAX_QUADS_PER_FRAME_INITIAL,
-            )),
-            path_vertices_buffer: RefCell::new((path_vertices_buffer, MAX_PATH_VERTICES_INITIAL)),
-            path_sprites_buffer: RefCell::new((path_sprites_buffer, MAX_QUADS_PER_FRAME_INITIAL)),
+            atlas_size_cursor: Cell::new(0),
+            quads_buffer,
+            underlines_buffer,
+            shadows_buffer,
+            monochrome_sprites_buffer,
+            polychrome_sprites_buffer,
+            path_vertices_buffer,
+            path_vertices_cursor: Cell::new(0),
+            path_sprites_buffer,
+            path_sprites_cursor: Cell::new(0),
             path_intermediate_texture: RefCell::new(None),
             path_intermediate_msaa_texture: RefCell::new(None),
             path_intermediate_size: Cell::new(None),
@@ -535,25 +760,55 @@ impl Metal4Renderer {
             resident_atlas_texture: Cell::new(None),
             shared_event,
             frame_number: Cell::new(0),
+            current_slot: Cell::new(0),
         }
     }
 
+    /// Sub-allocates a `length`-byte buffer from `heap` — the normal path
+    /// for every renderer-owned buffer, resident automatically because
+    /// `heap` itself is `residency_set`'s only member covering these (see
+    /// `instance_heap`'s field doc comment). Only on the genuinely rare
+    /// frame where `heap` has no room left (`newBufferWithLength:options:`
+    /// returns `nil` — never a hard error) does this fall back to a
+    /// standalone, individually-tracked buffer, so a pathological scene
+    /// degrades rather than failing outright; logged, since that fallback
+    /// buffer's `addAllocation` is a real, permanent residency-set entry a
+    /// caller has to `removeAllocation` itself when the buffer is replaced
+    /// (`write_full`/`ensure_capacity` already do, unconditionally, since
+    /// removing a non-member is a documented-safe no-op).
     fn new_buffer(
         device: &ProtocolObject<dyn MTLDevice>,
+        heap: &ProtocolObject<dyn MTLHeap>,
+        residency_set: &ProtocolObject<dyn MTLResidencySet>,
         length: usize,
     ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
-        unsafe {
-            device.newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
+        if let Some(buffer) =
+            heap.newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
+        {
+            return buffer;
         }
-        .expect("metal4: device could not allocate an MTLBuffer")
+        log::warn!(
+            "metal4: instance heap exhausted ({length} more bytes needed) — falling back to a standalone, individually resident buffer"
+        );
+        let buffer =
+            { device.newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared) }
+                .expect("metal4: device could not allocate a fallback MTLBuffer");
+        {
+            residency_set.addAllocation(buffer.as_ref());
+            residency_set.commit();
+            residency_set.requestResidency();
+        }
+        buffer
     }
 
     fn new_buffer_with_data(
         device: &ProtocolObject<dyn MTLDevice>,
+        heap: &ProtocolObject<dyn MTLHeap>,
+        residency_set: &ProtocolObject<dyn MTLResidencySet>,
         bytes: *const c_void,
         length: usize,
     ) -> Retained<ProtocolObject<dyn MTLBuffer>> {
-        let buffer = Self::new_buffer(device, length);
+        let buffer = Self::new_buffer(device, heap, residency_set, length);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes as *const u8,
@@ -602,25 +857,27 @@ impl Metal4Renderer {
         vertex_fn_name: &str,
         fragment_fn_name: &str,
     ) -> Retained<ProtocolObject<dyn MTLRenderPipelineState>> {
-        let vertex_function_descriptor = unsafe { MTL4LibraryFunctionDescriptor::new() };
-        unsafe {
+        let vertex_function_descriptor = MTL4LibraryFunctionDescriptor::new();
+        {
             vertex_function_descriptor.setLibrary(Some(library));
             vertex_function_descriptor
                 .setName(Some(&objc2_foundation::NSString::from_str(vertex_fn_name)));
         }
-        let fragment_function_descriptor = unsafe { MTL4LibraryFunctionDescriptor::new() };
-        unsafe {
+        let fragment_function_descriptor = MTL4LibraryFunctionDescriptor::new();
+        {
             fragment_function_descriptor.setLibrary(Some(library));
             fragment_function_descriptor.setName(Some(&objc2_foundation::NSString::from_str(
                 fragment_fn_name,
             )));
         }
 
-        let pipeline_descriptor = unsafe { MTL4RenderPipelineDescriptor::new() };
+        let pipeline_descriptor = MTL4RenderPipelineDescriptor::new();
         unsafe {
             pipeline_descriptor.setVertexFunctionDescriptor(Some(&vertex_function_descriptor));
             pipeline_descriptor.setFragmentFunctionDescriptor(Some(&fragment_function_descriptor));
-            let color_attachment = pipeline_descriptor.colorAttachments().objectAtIndexedSubscript(0);
+            let color_attachment = pipeline_descriptor
+                .colorAttachments()
+                .objectAtIndexedSubscript(0);
             color_attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
             color_attachment.setBlendingState(MTL4BlendState::Enabled);
             color_attachment.setRgbBlendOperation(objc2_metal::MTLBlendOperation::Add);
@@ -650,25 +907,28 @@ impl Metal4Renderer {
         compiler: &ProtocolObject<dyn MTL4Compiler>,
         library: &ProtocolObject<dyn objc2_metal::MTLLibrary>,
     ) -> Retained<ProtocolObject<dyn MTLRenderPipelineState>> {
-        let vertex_function_descriptor = unsafe { MTL4LibraryFunctionDescriptor::new() };
-        unsafe {
+        let vertex_function_descriptor = MTL4LibraryFunctionDescriptor::new();
+        {
             vertex_function_descriptor.setLibrary(Some(library));
-            vertex_function_descriptor
-                .setName(Some(&objc2_foundation::NSString::from_str("path_sprite_vertex")));
+            vertex_function_descriptor.setName(Some(&objc2_foundation::NSString::from_str(
+                "path_sprite_vertex",
+            )));
         }
-        let fragment_function_descriptor = unsafe { MTL4LibraryFunctionDescriptor::new() };
-        unsafe {
+        let fragment_function_descriptor = MTL4LibraryFunctionDescriptor::new();
+        {
             fragment_function_descriptor.setLibrary(Some(library));
             fragment_function_descriptor.setName(Some(&objc2_foundation::NSString::from_str(
                 "path_sprite_fragment",
             )));
         }
 
-        let pipeline_descriptor = unsafe { MTL4RenderPipelineDescriptor::new() };
+        let pipeline_descriptor = MTL4RenderPipelineDescriptor::new();
         unsafe {
             pipeline_descriptor.setVertexFunctionDescriptor(Some(&vertex_function_descriptor));
             pipeline_descriptor.setFragmentFunctionDescriptor(Some(&fragment_function_descriptor));
-            let color_attachment = pipeline_descriptor.colorAttachments().objectAtIndexedSubscript(0);
+            let color_attachment = pipeline_descriptor
+                .colorAttachments()
+                .objectAtIndexedSubscript(0);
             color_attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
             color_attachment.setBlendingState(MTL4BlendState::Enabled);
             color_attachment.setRgbBlendOperation(objc2_metal::MTLBlendOperation::Add);
@@ -702,29 +962,31 @@ impl Metal4Renderer {
         compiler: &ProtocolObject<dyn MTL4Compiler>,
         library: &ProtocolObject<dyn objc2_metal::MTLLibrary>,
     ) -> Retained<ProtocolObject<dyn MTLRenderPipelineState>> {
-        let vertex_function_descriptor = unsafe { MTL4LibraryFunctionDescriptor::new() };
-        unsafe {
+        let vertex_function_descriptor = MTL4LibraryFunctionDescriptor::new();
+        {
             vertex_function_descriptor.setLibrary(Some(library));
             vertex_function_descriptor.setName(Some(&objc2_foundation::NSString::from_str(
                 "path_rasterization_vertex",
             )));
         }
-        let fragment_function_descriptor = unsafe { MTL4LibraryFunctionDescriptor::new() };
-        unsafe {
+        let fragment_function_descriptor = MTL4LibraryFunctionDescriptor::new();
+        {
             fragment_function_descriptor.setLibrary(Some(library));
             fragment_function_descriptor.setName(Some(&objc2_foundation::NSString::from_str(
                 "path_rasterization_fragment",
             )));
         }
 
-        let pipeline_descriptor = unsafe { MTL4RenderPipelineDescriptor::new() };
+        let pipeline_descriptor = MTL4RenderPipelineDescriptor::new();
         unsafe {
             pipeline_descriptor.setVertexFunctionDescriptor(Some(&vertex_function_descriptor));
             pipeline_descriptor.setFragmentFunctionDescriptor(Some(&fragment_function_descriptor));
             if PATH_SAMPLE_COUNT > 1 {
                 pipeline_descriptor.setRasterSampleCount(PATH_SAMPLE_COUNT as usize);
             }
-            let color_attachment = pipeline_descriptor.colorAttachments().objectAtIndexedSubscript(0);
+            let color_attachment = pipeline_descriptor
+                .colorAttachments()
+                .objectAtIndexedSubscript(0);
             color_attachment.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
             color_attachment.setBlendingState(MTL4BlendState::Enabled);
             color_attachment.setRgbBlendOperation(objc2_metal::MTLBlendOperation::Add);
@@ -789,18 +1051,30 @@ impl Metal4Renderer {
         // nothing to do
     }
 
+    /// The current frame's command buffer — `self.command_buffers[self.
+    /// current_slot.get()]`. `current_slot` is set once, at the top of
+    /// `draw()`/`render_scene_to_image()`, before any of this frame's
+    /// encoding happens, so every method that needs "this frame's command
+    /// buffer" (`begin_main_encoder`, `draw_paths_to_intermediate`, …) can
+    /// just call this instead of taking an extra parameter.
+    fn command_buffer(&self) -> &ProtocolObject<dyn MTL4CommandBuffer> {
+        &self.command_buffers[self.current_slot.get()]
+    }
+
     /// Renders every `gpui::Scene` primitive kind: `scene.shadows`,
     /// `scene.paths`, `scene.quads`, `scene.underlines`,
     /// `scene.monochrome_sprites`, `scene.polychrome_sprites`, and
-    /// `scene.surfaces`. Two deliberate simplifications remain, documented
-    /// where they're implemented rather than repeated per call site: draw
-    /// order between primitive *types* is fixed (shadows, then paths, then
-    /// quads, underlines, sprites, surfaces) rather than following the
-    /// scene's real z-order, and a few of the individual `draw_*` methods
-    /// have their own narrower simplifications (e.g. `draw_monochrome_sprites`
-    /// assumes one atlas texture per draw call, `draw_paths_from_intermediate`
-    /// always emits one composite sprite per path). See the module doc
-    /// comment and each method's own doc comment for the specifics.
+    /// `scene.surfaces`. Dispatches through `draw_batches`, which walks
+    /// `scene.batches()` — the same painter's-algorithm iterator
+    /// `MetalRenderer` itself uses — so draw order follows the scene's real
+    /// z-order across primitive *types*, not just within one type: a
+    /// contiguous run of same-kind primitives (and, for sprites, same-atlas-
+    /// texture primitives) still becomes a single `drawPrimitives` call, but
+    /// the run ends the moment the next primitive in paint order is a
+    /// different kind. One deliberate simplification remains:
+    /// `draw_paths_from_intermediate` always emits one composite sprite per
+    /// path, which can double-blend an overlapping region of two
+    /// *same-batch* transparent paths — see its doc comment.
     pub fn draw(&mut self, scene: &Scene) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
@@ -824,92 +1098,44 @@ impl Metal4Renderer {
             }
         };
 
-        // Fully serialize frames: wait for the previous frame's GPU work
-        // before reusing the sole allocator/command buffer/quads buffer.
-        // (A production implementation would triple-buffer these instead,
-        // per Apple's guidance — deliberately skipped here, see module doc.)
+        // Triple-buffered: pick this frame's allocator/instance-buffer slot
+        // and only wait for the *last* frame that used it
+        // (frame_number - FRAME_SLOTS), not the previous frame — see
+        // `allocators`'s and `current_slot`'s field doc comments. Once
+        // `frame_number > FRAME_SLOTS` every slot has been used before, so
+        // that wait always applies from then on; before that, every slot is
+        // still on its first, never-before-used allocator/buffers, so there
+        // is nothing to wait for.
         let frame_number = self.frame_number.get() + 1;
         self.frame_number.set(frame_number);
-        if frame_number > 1 {
-            let previous = frame_number - 1;
-            let signaled = unsafe { self.shared_event.waitUntilSignaledValue_timeoutMS(previous, 1000) };
+        let slot = ((frame_number - 1) % FRAME_SLOTS as u64) as usize;
+        self.current_slot.set(slot);
+        if frame_number > FRAME_SLOTS as u64 {
+            let previous_use = frame_number - FRAME_SLOTS as u64;
+            let signaled = {
+                self.shared_event
+                    .waitUntilSignaledValue_timeoutMS(previous_use, 1000)
+            };
             if !signaled {
-                log::error!("metal4: timed out waiting for frame {previous} to finish on the GPU");
+                log::error!(
+                    "metal4: timed out waiting for frame {previous_use} (slot {slot}'s last use) to finish on the GPU"
+                );
             }
         }
 
-        unsafe { self.allocator.reset() };
-        unsafe {
-            self.command_buffer
-                .beginCommandBufferWithAllocator(&self.allocator)
-        };
-
-        // Its own render pass, so it has to happen before the main one
-        // below is created — Metal can't have two encoders active on one
-        // command buffer at once. See draw_paths_to_intermediate's doc
-        // comment for why paths end up composited before quads/underlines/
-        // sprites in every frame rather than at their real scene position.
-        let did_rasterize_paths = self.draw_paths_to_intermediate(&scene.paths, viewport_size_px);
+        self.allocators[slot].reset();
+        self.command_buffer()
+            .beginCommandBufferWithAllocator(&self.allocators[slot]);
 
         let texture: Retained<ProtocolObject<dyn objc2_metal::MTLTexture>> =
             unsafe { bridge_retain(drawable.texture().as_ptr() as *mut c_void) };
 
-        let render_pass_descriptor = unsafe { MTL4RenderPassDescriptor::new() };
-        unsafe {
-            let color_attachment = render_pass_descriptor.colorAttachments().objectAtIndexedSubscript(0);
-            color_attachment.setTexture(Some(&texture));
-            color_attachment.setLoadAction(MTLLoadAction::Clear);
-            color_attachment.setStoreAction(MTLStoreAction::Store);
-            let alpha = if self.opaque { 1.0 } else { 0.0 };
-            color_attachment.setClearColor(MTLClearColor {
-                red: 0.0,
-                green: 0.0,
-                blue: 0.0,
-                alpha,
-            });
-        }
+        let alpha = if self.opaque { 1.0 } else { 0.0 };
+        let encoder = self.begin_main_encoder(&texture, Some(alpha), viewport_size_px);
+        let encoder = self.draw_batches(scene, viewport_size_px, &texture, encoder);
 
-        let encoder = unsafe {
-            self.command_buffer
-                .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
-        }
-        .expect("metal4: failed to create a render command encoder");
-
-        unsafe {
-            encoder.setViewport(objc2_metal::MTLViewport {
-                originX: 0.0,
-                originY: 0.0,
-                width: i32::from(viewport_size_px.width) as f64,
-                height: i32::from(viewport_size_px.height) as f64,
-                znear: 0.0,
-                zfar: 1.0,
-            });
-        }
-
-        if !scene.shadows.is_empty() {
-            self.draw_shadows(&scene.shadows, viewport_size_px, &encoder);
-        }
-        if did_rasterize_paths {
-            self.draw_paths_from_intermediate(&scene.paths, viewport_size_px, &encoder);
-        }
-        if !scene.quads.is_empty() {
-            self.draw_quads(&scene.quads, viewport_size_px, &encoder);
-        }
-        if !scene.underlines.is_empty() {
-            self.draw_underlines(&scene.underlines, viewport_size_px, &encoder);
-        }
-        if !scene.monochrome_sprites.is_empty() {
-            self.draw_monochrome_sprites(&scene.monochrome_sprites, viewport_size_px, &encoder);
-        }
-        if !scene.polychrome_sprites.is_empty() {
-            self.draw_polychrome_sprites(&scene.polychrome_sprites, viewport_size_px, &encoder);
-        }
-        if !scene.surfaces.is_empty() {
-            self.draw_surfaces(&scene.surfaces, viewport_size_px, &encoder);
-        }
-
-        unsafe { encoder.endEncoding() };
-        unsafe { self.command_buffer.endCommandBuffer() };
+        encoder.endEncoding();
+        self.command_buffer().endCommandBuffer();
 
         // Present choreography verified against Apple's own sample
         // (Metal4Renderer+Encoding.m's `submitCommandBuffer:toCommandQueue:forView:`):
@@ -918,33 +1144,299 @@ impl Metal4Renderer {
         // from the command buffer in Metal 4.
         let mtl_drawable: Retained<ProtocolObject<dyn objc2_metal::MTLDrawable>> =
             unsafe { bridge_retain(drawable.as_ptr() as *mut c_void) };
-        unsafe { self.queue.waitForDrawable(&mtl_drawable) };
+        self.queue.waitForDrawable(&mtl_drawable);
 
         let mut command_buffers: [NonNull<ProtocolObject<dyn MTL4CommandBuffer>>; 1] =
-            [NonNull::from(&*self.command_buffer)];
+            [NonNull::from(self.command_buffer())];
         unsafe {
             self.queue
                 .commit_count(NonNull::from(&mut command_buffers[0]), 1)
         };
 
-        unsafe { self.queue.signalDrawable(&mtl_drawable) };
+        self.queue.signalDrawable(&mtl_drawable);
         drawable.present();
 
+        self.queue
+            .signalEvent_value(ProtocolObject::from_ref(&*self.shared_event), frame_number);
+    }
+
+    /// Starts a new `MTL4RenderCommandEncoder` against `texture`, viewport
+    /// already set. `clear_alpha` picks the color-attachment load action:
+    /// `Some(alpha)` clears to transparent-black-or-opaque-black (used once,
+    /// at the top of a frame); `None` loads the attachment's existing
+    /// contents instead, which is what `draw_batches` needs every time it
+    /// has to end-and-restart the encoder around a `Paths` batch (Metal
+    /// can't have two render command encoders active on one command buffer
+    /// at once, so compositing the path-rasterization intermediate texture
+    /// — its own pass, see `draw_paths_to_intermediate` — means suspending
+    /// the main pass, not drawing inside it).
+    fn begin_main_encoder(
+        &self,
+        texture: &ProtocolObject<dyn objc2_metal::MTLTexture>,
+        clear_alpha: Option<f64>,
+        viewport_size: Size<DevicePixels>,
+    ) -> Retained<ProtocolObject<dyn MTL4RenderCommandEncoder>> {
+        let render_pass_descriptor = MTL4RenderPassDescriptor::new();
         unsafe {
-            self.queue.signalEvent_value(
-                ProtocolObject::from_ref(&*self.shared_event),
-                frame_number,
-            )
-        };
+            let color_attachment = render_pass_descriptor
+                .colorAttachments()
+                .objectAtIndexedSubscript(0);
+            color_attachment.setTexture(Some(texture));
+            color_attachment.setStoreAction(MTLStoreAction::Store);
+            match clear_alpha {
+                Some(alpha) => {
+                    color_attachment.setLoadAction(MTLLoadAction::Clear);
+                    color_attachment.setClearColor(MTLClearColor {
+                        red: 0.0,
+                        green: 0.0,
+                        blue: 0.0,
+                        alpha,
+                    });
+                }
+                None => color_attachment.setLoadAction(MTLLoadAction::Load),
+            }
+        }
+
+        let encoder = self
+            .command_buffer()
+            .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
+            .expect("metal4: failed to create a render command encoder");
+
+        encoder.setViewport(objc2_metal::MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: i32::from(viewport_size.width) as f64,
+            height: i32::from(viewport_size.height) as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+
+        encoder
+    }
+
+    /// Grows `buffer` (if needed) then copies the *entire* `data` slice into
+    /// it, starting at element 0.
+    ///
+    /// Must be called **at most once per frame**, before any `draw_*` call
+    /// that reads `buffer`, never per-batch. `MTLBuffer` contents written
+    /// via a raw CPU pointer (`contents()`, as every `copy_nonoverlapping`
+    /// in this file does) are not part of the recorded command stream the
+    /// way a `setVertexBuffer:offset:atIndex:` *binding* is — the GPU reads
+    /// them live, only once the whole command buffer actually executes,
+    /// which happens after `commit()`, i.e. after every CPU write for the
+    /// *entire frame* has already happened. If two draw calls this frame
+    /// both wrote their own data into the same buffer at offset 0 (which is
+    /// exactly what calling a `draw_*` method once per `scene.batches()` run
+    /// of its kind would do), every draw call referencing that buffer would
+    /// render using whichever call's write happened to be *last*, not its
+    /// own — this was the actual cause of the corrupted glyphs/quad borders
+    /// `draw_batches` first shipped with. The fix: write each kind's full
+    /// per-frame array here, once, and have every batch of that kind read
+    /// its own slice out of the *same* already-fully-written buffer via
+    /// `baseInstance`/`vertexStart` (see `draw_quads` and friends) instead
+    /// of re-writing it.
+    fn write_full<T: Copy>(
+        &self,
+        buffer_cell: &RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
+        data: &[T],
+    ) {
+        let mut buffer = buffer_cell.borrow_mut();
+        if data.len() > buffer.1 {
+            let new_capacity = data.len().next_power_of_two();
+            let new_buffer = Self::new_buffer(
+                &self.mtl4_device,
+                &self.instance_heap,
+                &self.residency_set,
+                mem::size_of::<T>() * new_capacity,
+            );
+            // Safe even though `buffer.0` usually never went through
+            // `new_buffer`'s own fallback `addAllocation` at all (it's
+            // heap-backed, covered by `instance_heap`'s single membership)
+            // — `removeAllocation` on a non-member is a documented no-op
+            // (see `instance_heap`'s field doc comment). This only does
+            // real work, and only needs to, for the rare buffer that *did*
+            // take the fallback path.
+            {
+                self.residency_set.removeAllocation(buffer.0.as_ref());
+                self.residency_set.commit();
+            }
+            *buffer = (new_buffer, new_capacity);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                buffer.0.contents().as_ptr() as *mut T,
+                data.len(),
+            );
+        }
+    }
+
+    /// Grows `buffer` (if needed) to hold at least `min_elements`, without
+    /// writing anything — the bump-allocated counterpart to `write_full`,
+    /// for buffers multiple draw calls this frame each append their own
+    /// slice to (`path_vertices_buffer`, `path_sprites_buffer`) rather than
+    /// each holding the whole frame's data in one write. Growing has to
+    /// happen once, up front, sized for the frame's *total* — growing again
+    /// mid-frame would free the old buffer while an earlier-this-frame draw
+    /// call still references its GPU address (see `write_full`'s doc
+    /// comment for why that address is only read after every batch has been
+    /// encoded, not as each batch is encoded).
+    fn ensure_capacity<T>(
+        &self,
+        buffer_cell: &RefCell<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>,
+        min_elements: usize,
+    ) {
+        let mut buffer = buffer_cell.borrow_mut();
+        if min_elements > buffer.1 {
+            let new_capacity = min_elements.next_power_of_two();
+            let new_buffer = Self::new_buffer(
+                &self.mtl4_device,
+                &self.instance_heap,
+                &self.residency_set,
+                mem::size_of::<T>() * new_capacity,
+            );
+            // See `write_full`'s matching comment — a no-op unless `buffer.0`
+            // happened to be a fallback (non-heap) buffer.
+            {
+                self.residency_set.removeAllocation(buffer.0.as_ref());
+                self.residency_set.commit();
+            }
+            *buffer = (new_buffer, new_capacity);
+        }
+    }
+
+    /// Walks `scene.batches()` — the same painter's-algorithm iterator
+    /// `MetalRenderer::draw_primitives_to_texture` drives — dispatching each
+    /// contiguous run to the matching `draw_*` method with just that run's
+    /// range, so draw order matches the scene's real paint order across
+    /// primitive types while same-kind (same-atlas-texture, for sprites)
+    /// runs still collapse into one `drawPrimitives` call. A `Paths` batch
+    /// is the one kind that can't just draw into `encoder`: rasterizing into
+    /// the shared intermediate texture is its own render pass (see
+    /// `draw_paths_to_intermediate`), so this ends `encoder`, runs that
+    /// pass, opens a fresh encoder over the same `texture` with `Load`
+    /// (preserving everything painted so far), and composites that batch's
+    /// paths into it before continuing — mirroring how
+    /// `MetalRenderer::draw_primitives_to_texture` ends and recreates its
+    /// own encoder around each `PrimitiveBatch::Paths`. Returns the final
+    /// live encoder, still open, for the caller to end.
+    ///
+    /// Before the loop, writes each non-empty kind's *entire* per-frame
+    /// array into its instance buffer exactly once via `write_full` (or, for
+    /// the two path buffers — which each batch has to append its own slice
+    /// to rather than write in one shot — pre-grows them to the frame's
+    /// total via `ensure_capacity` and resets their bump cursors). See
+    /// `write_full`'s doc comment for why calling a `draw_*` method's own
+    /// buffer-write once per *batch* instead, the way an earlier version of
+    /// this method did, corrupts every draw call of that kind.
+    fn draw_batches(
+        &self,
+        scene: &Scene,
+        viewport_size: Size<DevicePixels>,
+        texture: &ProtocolObject<dyn objc2_metal::MTLTexture>,
+        mut encoder: Retained<ProtocolObject<dyn MTL4RenderCommandEncoder>>,
+    ) -> Retained<ProtocolObject<dyn MTL4RenderCommandEncoder>> {
+        let slot = self.current_slot.get();
+        if !scene.shadows.is_empty() {
+            self.write_full(&self.shadows_buffer[slot], &scene.shadows);
+        }
+        if !scene.quads.is_empty() {
+            self.write_full(&self.quads_buffer[slot], &scene.quads);
+        }
+        if !scene.underlines.is_empty() {
+            self.write_full(&self.underlines_buffer[slot], &scene.underlines);
+        }
+        if !scene.monochrome_sprites.is_empty() {
+            self.write_full(
+                &self.monochrome_sprites_buffer[slot],
+                &scene.monochrome_sprites,
+            );
+        }
+        if !scene.polychrome_sprites.is_empty() {
+            self.write_full(
+                &self.polychrome_sprites_buffer[slot],
+                &scene.polychrome_sprites,
+            );
+        }
+        let total_path_vertices: usize = scene.paths.iter().map(|path| path.vertices.len()).sum();
+        self.ensure_capacity::<PathRasterizationVertex>(
+            &self.path_vertices_buffer[slot],
+            total_path_vertices,
+        );
+        self.ensure_capacity::<PathSprite>(&self.path_sprites_buffer[slot], scene.paths.len());
+        // An upper bound, not the exact batch count (computing that exactly
+        // would mean draining `scene.batches()` once just to count, then
+        // again to draw) — every `MonochromeSprites`/`PolychromeSprites`
+        // batch has at least one sprite, so the number of such batches can
+        // never exceed the total sprite count. `ViewportSize` is 8 bytes, so
+        // even a generous overshoot here costs nothing.
+        let sprite_batches_upper_bound =
+            scene.monochrome_sprites.len() + scene.polychrome_sprites.len();
+        self.ensure_capacity::<ViewportSize>(
+            &self.atlas_size_buffer[slot],
+            sprite_batches_upper_bound,
+        );
+        self.atlas_size_cursor.set(0);
+        self.path_vertices_cursor.set(0);
+        self.path_sprites_cursor.set(0);
+
+        for batch in scene.batches() {
+            match batch {
+                PrimitiveBatch::Shadows(range) => {
+                    self.draw_shadows(range, viewport_size, &encoder);
+                }
+                PrimitiveBatch::Quads(range) => {
+                    self.draw_quads(range, viewport_size, &encoder);
+                }
+                PrimitiveBatch::Paths(range) => {
+                    let paths = &scene.paths[range];
+
+                    encoder.endEncoding();
+                    let did_rasterize = self.draw_paths_to_intermediate(paths, viewport_size);
+                    encoder = self.begin_main_encoder(texture, None, viewport_size);
+
+                    if did_rasterize {
+                        self.draw_paths_from_intermediate(paths, viewport_size, &encoder);
+                    }
+                }
+                PrimitiveBatch::Underlines(range) => {
+                    self.draw_underlines(range, viewport_size, &encoder);
+                }
+                PrimitiveBatch::MonochromeSprites { range, .. } => {
+                    self.draw_monochrome_sprites(
+                        &scene.monochrome_sprites,
+                        range,
+                        viewport_size,
+                        &encoder,
+                    );
+                }
+                PrimitiveBatch::PolychromeSprites { range, .. } => {
+                    self.draw_polychrome_sprites(
+                        &scene.polychrome_sprites,
+                        range,
+                        viewport_size,
+                        &encoder,
+                    );
+                }
+                PrimitiveBatch::Surfaces(range) => {
+                    self.draw_surfaces(&scene.surfaces[range], viewport_size, &encoder);
+                }
+                PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+            }
+        }
+
+        encoder
     }
 
     /// Renders a scene to an offscreen texture and reads back the pixels —
     /// no window, `CAMetalLayer`, or drawable involved. Mirrors
-    /// `MetalRenderer::render_scene_to_image`, with the same one-command-
-    /// buffer serialization `draw()` uses instead of that method's
-    /// synchronous `wait_until_completed` (there's no `MTL4CommandBuffer`
-    /// equivalent of that call — completion is only observable via an
-    /// `MTLSharedEvent`, so this reuses the renderer's own).
+    /// `MetalRenderer::render_scene_to_image`, with the same
+    /// `FRAME_SLOTS`-way triple-buffered allocator/command-buffer/instance-
+    /// buffer rotation `draw()` uses (see the module doc comment) instead
+    /// of that method's synchronous `wait_until_completed` (there's no
+    /// `MTL4CommandBuffer` equivalent of that call — completion is only
+    /// observable via an `MTLSharedEvent`, so this reuses the renderer's
+    /// own).
     #[cfg(any(test, feature = "test-support"))]
     pub fn render_scene_to_image(
         &mut self,
@@ -961,9 +1453,8 @@ impl Metal4Renderer {
         texture_descriptor.set_width(size.width.0 as u64);
         texture_descriptor.set_height(size.height.0 as u64);
         texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
-        texture_descriptor.set_usage(
-            metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
-        );
+        texture_descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
         // `Shared`, not `Managed` (which is what MetalRenderer's Metal 3
         // path uses): Shared needs no explicit CPU/GPU synchronization on
         // either unified or discrete memory, sidestepping the blit-encoder
@@ -982,95 +1473,56 @@ impl Metal4Renderer {
             self.residency_set.requestResidency();
         }
 
+        // See `draw()`'s matching block for why the wait target and reset
+        // are slot-relative, not "the previous frame," now that
+        // `FRAME_SLOTS` allocators/command buffers/instance buffers exist.
         let frame_number = self.frame_number.get() + 1;
         self.frame_number.set(frame_number);
-        if frame_number > 1 {
-            let previous = frame_number - 1;
-            let signaled =
-                unsafe { self.shared_event.waitUntilSignaledValue_timeoutMS(previous, 1000) };
+        let slot = ((frame_number - 1) % FRAME_SLOTS as u64) as usize;
+        self.current_slot.set(slot);
+        if frame_number > FRAME_SLOTS as u64 {
+            let previous_use = frame_number - FRAME_SLOTS as u64;
+            let signaled = unsafe {
+                self.shared_event
+                    .waitUntilSignaledValue_timeoutMS(previous_use, 1000)
+            };
             if !signaled {
-                log::error!("metal4: timed out waiting for frame {previous} to finish on the GPU");
+                log::error!(
+                    "metal4: timed out waiting for frame {previous_use} (slot {slot}'s last use) to finish on the GPU"
+                );
             }
         }
 
-        unsafe { self.allocator.reset() };
+        unsafe { self.allocators[slot].reset() };
         unsafe {
-            self.command_buffer
-                .beginCommandBufferWithAllocator(&self.allocator)
+            self.command_buffer()
+                .beginCommandBufferWithAllocator(&self.allocators[slot])
         };
 
-        let did_rasterize_paths = self.draw_paths_to_intermediate(&scene.paths, size);
-
-        let render_pass_descriptor = unsafe { MTL4RenderPassDescriptor::new() };
-        unsafe {
-            let color_attachment = render_pass_descriptor.colorAttachments().objectAtIndexedSubscript(0);
-            color_attachment.setTexture(Some(&target_texture));
-            color_attachment.setLoadAction(MTLLoadAction::Clear);
-            color_attachment.setStoreAction(MTLStoreAction::Store);
-            color_attachment.setClearColor(MTLClearColor {
-                red: 0.0,
-                green: 0.0,
-                blue: 0.0,
-                alpha: 1.0,
-            });
-        }
-
-        let encoder = unsafe {
-            self.command_buffer
-                .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
-        }
-        .expect("metal4: failed to create a render command encoder");
-
-        unsafe {
-            encoder.setViewport(objc2_metal::MTLViewport {
-                originX: 0.0,
-                originY: 0.0,
-                width: i32::from(size.width) as f64,
-                height: i32::from(size.height) as f64,
-                znear: 0.0,
-                zfar: 1.0,
-            });
-        }
-
-        if !scene.shadows.is_empty() {
-            self.draw_shadows(&scene.shadows, size, &encoder);
-        }
-        if did_rasterize_paths {
-            self.draw_paths_from_intermediate(&scene.paths, size, &encoder);
-        }
-        if !scene.quads.is_empty() {
-            self.draw_quads(&scene.quads, size, &encoder);
-        }
-        if !scene.underlines.is_empty() {
-            self.draw_underlines(&scene.underlines, size, &encoder);
-        }
-        if !scene.monochrome_sprites.is_empty() {
-            self.draw_monochrome_sprites(&scene.monochrome_sprites, size, &encoder);
-        }
-        if !scene.polychrome_sprites.is_empty() {
-            self.draw_polychrome_sprites(&scene.polychrome_sprites, size, &encoder);
-        }
-        if !scene.surfaces.is_empty() {
-            self.draw_surfaces(&scene.surfaces, size, &encoder);
-        }
+        // alpha: 1.0 unconditionally, unlike draw()'s `self.opaque`-derived
+        // alpha — a headless render target has no window behind it to show
+        // through, so it should always come back fully opaque regardless of
+        // the renderer's transparency setting.
+        let encoder = self.begin_main_encoder(&target_texture, Some(1.0), size);
+        let encoder = self.draw_batches(scene, size, &target_texture, encoder);
 
         unsafe { encoder.endEncoding() };
-        unsafe { self.command_buffer.endCommandBuffer() };
+        unsafe { self.command_buffer().endCommandBuffer() };
 
         let mut command_buffers: [NonNull<ProtocolObject<dyn MTL4CommandBuffer>>; 1] =
-            [NonNull::from(&*self.command_buffer)];
+            [NonNull::from(self.command_buffer())];
         unsafe {
             self.queue
                 .commit_count(NonNull::from(&mut command_buffers[0]), 1)
         };
         unsafe {
-            self.queue.signalEvent_value(
-                ProtocolObject::from_ref(&*self.shared_event),
-                frame_number,
-            )
+            self.queue
+                .signalEvent_value(ProtocolObject::from_ref(&*self.shared_event), frame_number)
         };
-        let signaled =
-            unsafe { self.shared_event.waitUntilSignaledValue_timeoutMS(frame_number, 5000) };
+        let signaled = unsafe {
+            self.shared_event
+                .waitUntilSignaledValue_timeoutMS(frame_number, 5000)
+        };
         if !signaled {
             bail!("metal4: timed out waiting for the headless frame to finish on the GPU");
         }
@@ -1078,39 +1530,29 @@ impl Metal4Renderer {
         read_texture_to_image(&legacy_target_texture)
     }
 
+    /// Draws `range` out of `quads_buffer`, which `draw_batches` has already
+    /// written *in full* for this frame via `write_full` — this method never
+    /// touches the buffer's contents, only which slice of it this call's
+    /// `drawPrimitives` reads, via `baseInstance`. MSL's `[[instance_id]]`
+    /// (see `quad_id` in `shaders.metal`'s `quad_vertex`) is defined to
+    /// start counting at `baseInstance`, so `quads[range.start]` becomes
+    /// `[[instance_id]] == range.start` in the shader without the shader
+    /// itself needing to know about the offset.
     fn draw_quads(
         &self,
-        quads: &[Quad],
+        range: Range<usize>,
         viewport_size: Size<DevicePixels>,
         encoder: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
     ) {
-        // Grow the quads buffer (and its residency registration) if needed.
-        {
-            let mut quads_buffer = self.quads_buffer.borrow_mut();
-            if quads.len() > quads_buffer.1 {
-                let new_capacity = quads.len().next_power_of_two();
-                let new_buffer =
-                    Self::new_buffer(&self.mtl4_device, mem::size_of::<Quad>() * new_capacity);
-                unsafe {
-                    self.residency_set.removeAllocation(quads_buffer.0.as_ref());
-                    self.residency_set.addAllocation(new_buffer.as_ref());
-                    self.residency_set.commit();
-                    self.residency_set.requestResidency();
-                }
-                *quads_buffer = (new_buffer, new_capacity);
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    quads.as_ptr(),
-                    quads_buffer.0.contents().as_ptr() as *mut Quad,
-                    quads.len(),
-                );
-            }
+        if range.is_empty() {
+            return;
         }
-        let quads_buffer = self.quads_buffer.borrow();
+        let slot = self.current_slot.get();
+        let quads_buffer = self.quads_buffer[slot].borrow();
+        let viewport_size_buffer = &self.viewport_size_buffer[slot];
 
         unsafe {
-            self.viewport_size_buffer
+            viewport_size_buffer
                 .contents()
                 .cast::<ViewportSize>()
                 .as_ptr()
@@ -1126,60 +1568,42 @@ impl Metal4Renderer {
             self.argument_table
                 .setAddress_atIndex(quads_buffer.0.gpuAddress(), 1);
             self.argument_table
-                .setAddress_atIndex(self.viewport_size_buffer.gpuAddress(), 2);
+                .setAddress_atIndex(viewport_size_buffer.gpuAddress(), 2);
             encoder.setArgumentTable_atStages(
                 &self.argument_table,
                 MTLRenderStages::Vertex | MTLRenderStages::Fragment,
             );
             encoder.setRenderPipelineState(&self.quad_pipeline_state);
-            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                 MTLPrimitiveType::Triangle,
                 0,
                 6,
-                quads.len(),
+                range.len(),
+                range.start,
             );
         }
     }
 
-    /// Mirrors `draw_quads` exactly — same buffer-growth strategy, same
-    /// argument-table indices (`UnderlineInputIndex` has the identical
-    /// numeric layout to `QuadInputIndex`: vertices=0, primitive-data=1,
-    /// viewport=2), just a different pipeline and instance type.
+    /// Mirrors `draw_quads` exactly — same argument-table indices
+    /// (`UnderlineInputIndex` has the identical numeric layout to
+    /// `QuadInputIndex`: vertices=0, primitive-data=1, viewport=2), just a
+    /// different pipeline and instance type. `underlines_buffer` is already
+    /// fully written for the frame by `draw_batches`.
     fn draw_underlines(
         &self,
-        underlines: &[Underline],
+        range: Range<usize>,
         viewport_size: Size<DevicePixels>,
         encoder: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
     ) {
-        {
-            let mut underlines_buffer = self.underlines_buffer.borrow_mut();
-            if underlines.len() > underlines_buffer.1 {
-                let new_capacity = underlines.len().next_power_of_two();
-                let new_buffer = Self::new_buffer(
-                    &self.mtl4_device,
-                    mem::size_of::<Underline>() * new_capacity,
-                );
-                unsafe {
-                    self.residency_set
-                        .removeAllocation(underlines_buffer.0.as_ref());
-                    self.residency_set.addAllocation(new_buffer.as_ref());
-                    self.residency_set.commit();
-                    self.residency_set.requestResidency();
-                }
-                *underlines_buffer = (new_buffer, new_capacity);
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    underlines.as_ptr(),
-                    underlines_buffer.0.contents().as_ptr() as *mut Underline,
-                    underlines.len(),
-                );
-            }
+        if range.is_empty() {
+            return;
         }
-        let underlines_buffer = self.underlines_buffer.borrow();
+        let slot = self.current_slot.get();
+        let underlines_buffer = self.underlines_buffer[slot].borrow();
+        let viewport_size_buffer = &self.viewport_size_buffer[slot];
 
         unsafe {
-            self.viewport_size_buffer
+            viewport_size_buffer
                 .contents()
                 .cast::<ViewportSize>()
                 .as_ptr()
@@ -1195,59 +1619,43 @@ impl Metal4Renderer {
             self.argument_table
                 .setAddress_atIndex(underlines_buffer.0.gpuAddress(), 1);
             self.argument_table
-                .setAddress_atIndex(self.viewport_size_buffer.gpuAddress(), 2);
+                .setAddress_atIndex(viewport_size_buffer.gpuAddress(), 2);
             encoder.setArgumentTable_atStages(
                 &self.argument_table,
                 MTLRenderStages::Vertex | MTLRenderStages::Fragment,
             );
             encoder.setRenderPipelineState(&self.underline_pipeline_state);
-            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                 MTLPrimitiveType::Triangle,
                 0,
                 6,
-                underlines.len(),
+                range.len(),
+                range.start,
             );
         }
     }
 
-    /// Mirrors `draw_quads`/`draw_underlines` exactly — same buffer-growth
-    /// strategy, same three argument-table indices (`ShadowInputIndex` has
-    /// the same numeric layout too), just the shadow pipeline and instance
-    /// type. The shadow shaders do all the blur/corner-radius math
+    /// Mirrors `draw_quads`/`draw_underlines` exactly — same three
+    /// argument-table indices (`ShadowInputIndex` has the same numeric
+    /// layout too), just the shadow pipeline and instance type.
+    /// `shadows_buffer` is already fully written for the frame by
+    /// `draw_batches`. The shadow shaders do all the blur/corner-radius math
     /// themselves from the raw `Shadow` fields; nothing extra to bind here.
     fn draw_shadows(
         &self,
-        shadows: &[Shadow],
+        range: Range<usize>,
         viewport_size: Size<DevicePixels>,
         encoder: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
     ) {
-        {
-            let mut shadows_buffer = self.shadows_buffer.borrow_mut();
-            if shadows.len() > shadows_buffer.1 {
-                let new_capacity = shadows.len().next_power_of_two();
-                let new_buffer =
-                    Self::new_buffer(&self.mtl4_device, mem::size_of::<Shadow>() * new_capacity);
-                unsafe {
-                    self.residency_set
-                        .removeAllocation(shadows_buffer.0.as_ref());
-                    self.residency_set.addAllocation(new_buffer.as_ref());
-                    self.residency_set.commit();
-                    self.residency_set.requestResidency();
-                }
-                *shadows_buffer = (new_buffer, new_capacity);
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    shadows.as_ptr(),
-                    shadows_buffer.0.contents().as_ptr() as *mut Shadow,
-                    shadows.len(),
-                );
-            }
+        if range.is_empty() {
+            return;
         }
-        let shadows_buffer = self.shadows_buffer.borrow();
+        let slot = self.current_slot.get();
+        let shadows_buffer = self.shadows_buffer[slot].borrow();
+        let viewport_size_buffer = &self.viewport_size_buffer[slot];
 
         unsafe {
-            self.viewport_size_buffer
+            viewport_size_buffer
                 .contents()
                 .cast::<ViewportSize>()
                 .as_ptr()
@@ -1263,19 +1671,42 @@ impl Metal4Renderer {
             self.argument_table
                 .setAddress_atIndex(shadows_buffer.0.gpuAddress(), 1);
             self.argument_table
-                .setAddress_atIndex(self.viewport_size_buffer.gpuAddress(), 2);
+                .setAddress_atIndex(viewport_size_buffer.gpuAddress(), 2);
             encoder.setArgumentTable_atStages(
                 &self.argument_table,
                 MTLRenderStages::Vertex | MTLRenderStages::Fragment,
             );
             encoder.setRenderPipelineState(&self.shadow_pipeline_state);
-            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                 MTLPrimitiveType::Triangle,
                 0,
                 6,
-                shadows.len(),
+                range.len(),
+                range.start,
             );
         }
+    }
+
+    /// Writes `width`/`height` into the next free slot of `atlas_size_buffer`
+    /// (see its field doc comment) and returns that slot's GPU address, for
+    /// `draw_monochrome_sprites`/`draw_polychrome_sprites` to bind. Advances
+    /// `atlas_size_cursor`; `draw_batches` already grew the buffer to fit
+    /// this frame's sprite-batch count (an upper bound, so always enough)
+    /// before the batch loop started, so this never needs to grow or clamp.
+    fn next_atlas_size_slot(&self, width: i32, height: i32) -> u64 {
+        let cursor = self.atlas_size_cursor.get();
+        self.atlas_size_cursor.set(cursor + 1);
+        let buffer = self.atlas_size_buffer[self.current_slot.get()].borrow();
+        unsafe {
+            buffer
+                .0
+                .contents()
+                .cast::<ViewportSize>()
+                .as_ptr()
+                .add(cursor)
+                .write(ViewportSize { width, height });
+        }
+        buffer.0.gpuAddress() + (cursor * mem::size_of::<ViewportSize>()) as u64
     }
 
     /// First primitive that samples a texture rather than just filling flat
@@ -1291,21 +1722,30 @@ impl Metal4Renderer {
     /// fall back on if that's missed (an unregistered texture would sample
     /// as garbage or fault, not just warn).
     ///
-    /// Simplification: assumes every sprite in `sprites` shares one atlas
-    /// texture (binds whichever `sprites[0].tile.texture_id` names, warns if
-    /// a later sprite's tile disagrees) rather than splitting into
-    /// per-texture-id batches the way `MetalRenderer::draw()` does via
-    /// `PrimitiveBatch`. True for any scene simple enough that its glyphs/
-    /// icons fit in the atlas's first texture, which is the common case;
-    /// revisit if that stops holding once this renders real app content.
+    /// Draws `range` out of `sprites` (the full `scene.monochrome_sprites`,
+    /// already fully written into `monochrome_sprites_buffer` for the frame
+    /// by `draw_batches` — see `write_full`'s doc comment for why this
+    /// method must not write to it itself). Reads `range.start`'s
+    /// `texture_id` rather than always index 0 (unlike a `draw_*` call given
+    /// a plain slice, `range` here indexes into the *whole-scene* array),
+    /// and warns if a later sprite in the range disagrees — that warning
+    /// should never fire in practice, since `scene.batches()` never puts two
+    /// different atlas textures in the same range (see `BatchIterator::
+    /// next`'s `texture_id == texture_id` guard); kept as a defensive check
+    /// rather than an `assert!`/unwrap, since a mis-batched call here would
+    /// otherwise silently sample the wrong tile.
     fn draw_monochrome_sprites(
         &self,
         sprites: &[MonochromeSprite],
+        range: Range<usize>,
         viewport_size: Size<DevicePixels>,
         encoder: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
     ) {
-        let texture_id = sprites[0].tile.texture_id;
-        if sprites
+        if range.is_empty() {
+            return;
+        }
+        let texture_id = sprites[range.start].tile.texture_id;
+        if sprites[range.clone()]
             .iter()
             .any(|sprite| sprite.tile.texture_id != texture_id)
         {
@@ -1320,7 +1760,7 @@ impl Metal4Renderer {
             unsafe { bridge_retain(legacy_texture.as_ptr() as *mut c_void) };
 
         if self.resident_atlas_texture.get() != Some(texture_id) {
-            unsafe {
+            {
                 self.residency_set.addAllocation(texture.as_ref());
                 self.residency_set.commit();
                 self.residency_set.requestResidency();
@@ -1328,35 +1768,12 @@ impl Metal4Renderer {
             self.resident_atlas_texture.set(Some(texture_id));
         }
 
-        {
-            let mut sprites_buffer = self.monochrome_sprites_buffer.borrow_mut();
-            if sprites.len() > sprites_buffer.1 {
-                let new_capacity = sprites.len().next_power_of_two();
-                let new_buffer = Self::new_buffer(
-                    &self.mtl4_device,
-                    mem::size_of::<MonochromeSprite>() * new_capacity,
-                );
-                unsafe {
-                    self.residency_set
-                        .removeAllocation(sprites_buffer.0.as_ref());
-                    self.residency_set.addAllocation(new_buffer.as_ref());
-                    self.residency_set.commit();
-                    self.residency_set.requestResidency();
-                }
-                *sprites_buffer = (new_buffer, new_capacity);
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    sprites.as_ptr(),
-                    sprites_buffer.0.contents().as_ptr() as *mut MonochromeSprite,
-                    sprites.len(),
-                );
-            }
-        }
-        let sprites_buffer = self.monochrome_sprites_buffer.borrow();
+        let slot = self.current_slot.get();
+        let sprites_buffer = self.monochrome_sprites_buffer[slot].borrow();
+        let viewport_size_buffer = &self.viewport_size_buffer[slot];
 
         unsafe {
-            self.viewport_size_buffer
+            viewport_size_buffer
                 .contents()
                 .cast::<ViewportSize>()
                 .as_ptr()
@@ -1364,15 +1781,9 @@ impl Metal4Renderer {
                     width: i32::from(viewport_size.width),
                     height: i32::from(viewport_size.height),
                 });
-            self.atlas_size_buffer
-                .contents()
-                .cast::<ViewportSize>()
-                .as_ptr()
-                .write(ViewportSize {
-                    width: texture.width() as i32,
-                    height: texture.height() as i32,
-                });
         }
+        let atlas_size_address =
+            self.next_atlas_size_slot(texture.width() as i32, texture.height() as i32);
 
         unsafe {
             self.argument_table
@@ -1380,9 +1791,9 @@ impl Metal4Renderer {
             self.argument_table
                 .setAddress_atIndex(sprites_buffer.0.gpuAddress(), 1);
             self.argument_table
-                .setAddress_atIndex(self.viewport_size_buffer.gpuAddress(), 2);
+                .setAddress_atIndex(viewport_size_buffer.gpuAddress(), 2);
             self.argument_table
-                .setAddress_atIndex(self.atlas_size_buffer.gpuAddress(), 3);
+                .setAddress_atIndex(atlas_size_address, 3);
             self.argument_table
                 .setTexture_atIndex(texture.gpuResourceID(), 4);
             encoder.setArgumentTable_atStages(
@@ -1390,18 +1801,18 @@ impl Metal4Renderer {
                 MTLRenderStages::Vertex | MTLRenderStages::Fragment,
             );
             encoder.setRenderPipelineState(&self.monochrome_sprite_pipeline_state);
-            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                 MTLPrimitiveType::Triangle,
                 0,
                 6,
-                sprites.len(),
+                range.len(),
+                range.start,
             );
         }
     }
 
     /// Same texture-binding/residency mechanics as `draw_monochrome_sprites`
-    /// (see its doc comment — same simplification too: assumes one atlas
-    /// texture per draw call), just `PolychromeSprite`/the polychrome
+    /// (see its doc comment), just `PolychromeSprite`/the polychrome
     /// pipeline and a BGRA8Unorm atlas texture instead of monochrome's
     /// single-channel A8Unorm one. The fragment shader samples the atlas
     /// directly as the sprite's final colour (modulated by `opacity` and a
@@ -1411,11 +1822,15 @@ impl Metal4Renderer {
     fn draw_polychrome_sprites(
         &self,
         sprites: &[PolychromeSprite],
+        range: Range<usize>,
         viewport_size: Size<DevicePixels>,
         encoder: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
     ) {
-        let texture_id = sprites[0].tile.texture_id;
-        if sprites
+        if range.is_empty() {
+            return;
+        }
+        let texture_id = sprites[range.start].tile.texture_id;
+        if sprites[range.clone()]
             .iter()
             .any(|sprite| sprite.tile.texture_id != texture_id)
         {
@@ -1430,7 +1845,7 @@ impl Metal4Renderer {
             unsafe { bridge_retain(legacy_texture.as_ptr() as *mut c_void) };
 
         if self.resident_atlas_texture.get() != Some(texture_id) {
-            unsafe {
+            {
                 self.residency_set.addAllocation(texture.as_ref());
                 self.residency_set.commit();
                 self.residency_set.requestResidency();
@@ -1438,35 +1853,12 @@ impl Metal4Renderer {
             self.resident_atlas_texture.set(Some(texture_id));
         }
 
-        {
-            let mut sprites_buffer = self.polychrome_sprites_buffer.borrow_mut();
-            if sprites.len() > sprites_buffer.1 {
-                let new_capacity = sprites.len().next_power_of_two();
-                let new_buffer = Self::new_buffer(
-                    &self.mtl4_device,
-                    mem::size_of::<PolychromeSprite>() * new_capacity,
-                );
-                unsafe {
-                    self.residency_set
-                        .removeAllocation(sprites_buffer.0.as_ref());
-                    self.residency_set.addAllocation(new_buffer.as_ref());
-                    self.residency_set.commit();
-                    self.residency_set.requestResidency();
-                }
-                *sprites_buffer = (new_buffer, new_capacity);
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    sprites.as_ptr(),
-                    sprites_buffer.0.contents().as_ptr() as *mut PolychromeSprite,
-                    sprites.len(),
-                );
-            }
-        }
-        let sprites_buffer = self.polychrome_sprites_buffer.borrow();
+        let slot = self.current_slot.get();
+        let sprites_buffer = self.polychrome_sprites_buffer[slot].borrow();
+        let viewport_size_buffer = &self.viewport_size_buffer[slot];
 
         unsafe {
-            self.viewport_size_buffer
+            viewport_size_buffer
                 .contents()
                 .cast::<ViewportSize>()
                 .as_ptr()
@@ -1474,15 +1866,9 @@ impl Metal4Renderer {
                     width: i32::from(viewport_size.width),
                     height: i32::from(viewport_size.height),
                 });
-            self.atlas_size_buffer
-                .contents()
-                .cast::<ViewportSize>()
-                .as_ptr()
-                .write(ViewportSize {
-                    width: texture.width() as i32,
-                    height: texture.height() as i32,
-                });
         }
+        let atlas_size_address =
+            self.next_atlas_size_slot(texture.width() as i32, texture.height() as i32);
 
         unsafe {
             self.argument_table
@@ -1490,9 +1876,9 @@ impl Metal4Renderer {
             self.argument_table
                 .setAddress_atIndex(sprites_buffer.0.gpuAddress(), 1);
             self.argument_table
-                .setAddress_atIndex(self.viewport_size_buffer.gpuAddress(), 2);
+                .setAddress_atIndex(viewport_size_buffer.gpuAddress(), 2);
             self.argument_table
-                .setAddress_atIndex(self.atlas_size_buffer.gpuAddress(), 3);
+                .setAddress_atIndex(atlas_size_address, 3);
             self.argument_table
                 .setTexture_atIndex(texture.gpuResourceID(), 4);
             encoder.setArgumentTable_atStages(
@@ -1500,11 +1886,12 @@ impl Metal4Renderer {
                 MTLRenderStages::Vertex | MTLRenderStages::Fragment,
             );
             encoder.setRenderPipelineState(&self.polychrome_sprite_pipeline_state);
-            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                 MTLPrimitiveType::Triangle,
                 0,
                 6,
-                sprites.len(),
+                range.len(),
+                range.start,
             );
         }
     }
@@ -1556,23 +1943,28 @@ impl Metal4Renderer {
             .set(Some((size.width.0, size.height.0)));
     }
 
-    /// Rasterizes every path in the scene into the shared, full-viewport-
-    /// sized intermediate texture — its own render pass, entirely separate
-    /// from the main one, since Metal (3 or 4 alike) can't switch render
-    /// targets mid-encoder. Called *before* the main encoder for the frame
-    /// exists, if there's anything to rasterize;
-    /// `draw_paths_from_intermediate` (called *during* the main encoder)
-    /// composites the result in afterwards. This is why paths end up drawn
-    /// before quads/underlines/sprites in every frame rather than
-    /// interleaved at each path's real position in the scene, the way
-    /// `MetalRenderer::draw()`'s per-batch `PrimitiveBatch` dispatch does —
-    /// the same "fixed draw order, not scene z-order between primitive
-    /// *types*" simplification already true of every other primitive this
-    /// renderer handles (see the module doc comment).
+    /// Rasterizes one `Paths` batch (a contiguous, same-order run from
+    /// `scene.batches()`, not necessarily every path in the scene) into the
+    /// shared, full-viewport-sized intermediate texture — its own render
+    /// pass, entirely separate from the main one, since Metal (3 or 4 alike)
+    /// can't switch render targets mid-encoder. `draw_batches` ends the main
+    /// encoder before calling this and opens a fresh one afterwards (see its
+    /// doc comment), so the composite this batch's `draw_paths_from_
+    /// intermediate` call performs lands at the right point in paint order
+    /// relative to whatever was drawn before and after it, mirroring how
+    /// `MetalRenderer::draw_primitives_to_texture` ends/recreates its own
+    /// encoder around each `PrimitiveBatch::Paths`.
     ///
     /// Returns whether anything was actually rasterized — mirrors
     /// `MetalRenderer::draw_paths_to_intermediate`'s `did_draw` bool, so the
     /// caller knows whether it's safe to skip the composite pass entirely.
+    ///
+    /// Writes this batch's flattened vertices into `path_vertices_buffer`
+    /// starting at `path_vertices_cursor`, not offset 0 — a second `Paths`
+    /// batch in the same frame must not overwrite the first batch's
+    /// vertices before the GPU has actually read them (see `write_full`'s
+    /// doc comment); `draw_batches` pre-grows the buffer to the whole
+    /// frame's vertex total up front so this never needs to reallocate.
     fn draw_paths_to_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
@@ -1606,35 +1998,31 @@ impl Metal4Renderer {
             return false;
         }
 
-        {
-            let mut path_vertices_buffer = self.path_vertices_buffer.borrow_mut();
-            if vertices.len() > path_vertices_buffer.1 {
-                let new_capacity = vertices.len().next_power_of_two();
-                let new_buffer = Self::new_buffer(
-                    &self.mtl4_device,
-                    mem::size_of::<PathRasterizationVertex>() * new_capacity,
-                );
-                unsafe {
-                    self.residency_set
-                        .removeAllocation(path_vertices_buffer.0.as_ref());
-                    self.residency_set.addAllocation(new_buffer.as_ref());
-                    self.residency_set.commit();
-                    self.residency_set.requestResidency();
-                }
-                *path_vertices_buffer = (new_buffer, new_capacity);
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    vertices.as_ptr(),
-                    path_vertices_buffer.0.contents().as_ptr() as *mut PathRasterizationVertex,
-                    vertices.len(),
-                );
-            }
-        }
-        let path_vertices_buffer = self.path_vertices_buffer.borrow();
-
+        // `draw_batches` already grew `path_vertices_buffer` to fit the
+        // whole frame's total vertex count via `ensure_capacity`, so this
+        // only ever appends at the current cursor — never grows (which
+        // would free the buffer while an earlier `Paths` batch this same
+        // frame still has an already-encoded rasterization draw pointing at
+        // its old GPU address; see `write_full`'s doc comment) and never
+        // overwrites an earlier batch's still-unread vertices at offset 0
+        // the way a single shared buffer written from scratch each call
+        // would.
+        let slot = self.current_slot.get();
+        let base_vertex = self.path_vertices_cursor.get();
+        self.path_vertices_cursor.set(base_vertex + vertices.len());
+        let path_vertices_buffer = self.path_vertices_buffer[slot].borrow();
         unsafe {
-            self.viewport_size_buffer
+            std::ptr::copy_nonoverlapping(
+                vertices.as_ptr(),
+                (path_vertices_buffer.0.contents().as_ptr() as *mut PathRasterizationVertex)
+                    .add(base_vertex),
+                vertices.len(),
+            );
+        }
+
+        let viewport_size_buffer = &self.viewport_size_buffer[slot];
+        unsafe {
+            viewport_size_buffer
                 .contents()
                 .cast::<ViewportSize>()
                 .as_ptr()
@@ -1645,10 +2033,11 @@ impl Metal4Renderer {
         }
 
         let msaa_texture_ref = self.path_intermediate_msaa_texture.borrow();
-        let render_pass_descriptor = unsafe { MTL4RenderPassDescriptor::new() };
+        let render_pass_descriptor = MTL4RenderPassDescriptor::new();
         unsafe {
-            let color_attachment =
-                render_pass_descriptor.colorAttachments().objectAtIndexedSubscript(0);
+            let color_attachment = render_pass_descriptor
+                .colorAttachments()
+                .objectAtIndexedSubscript(0);
             color_attachment.setLoadAction(MTLLoadAction::Clear);
             color_attachment.setClearColor(MTLClearColor {
                 red: 0.0,
@@ -1671,17 +2060,16 @@ impl Metal4Renderer {
             }
         }
 
-        let encoder = unsafe {
-            self.command_buffer
-                .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
-        }
-        .expect("metal4: failed to create a render command encoder for path rasterization");
+        let encoder = self
+            .command_buffer()
+            .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
+            .expect("metal4: failed to create a render command encoder for path rasterization");
 
         unsafe {
             self.argument_table
                 .setAddress_atIndex(path_vertices_buffer.0.gpuAddress(), 0);
             self.argument_table
-                .setAddress_atIndex(self.viewport_size_buffer.gpuAddress(), 1);
+                .setAddress_atIndex(viewport_size_buffer.gpuAddress(), 1);
             encoder.setArgumentTable_atStages(
                 &self.argument_table,
                 MTLRenderStages::Vertex | MTLRenderStages::Fragment,
@@ -1689,7 +2077,7 @@ impl Metal4Renderer {
             encoder.setRenderPipelineState(&self.path_rasterization_pipeline_state);
             encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
                 MTLPrimitiveType::Triangle,
-                0,
+                base_vertex,
                 vertices.len(),
                 1,
             );
@@ -1699,24 +2087,22 @@ impl Metal4Renderer {
         true
     }
 
-    /// Composites the shared intermediate texture — already fully
-    /// rasterized by `draw_paths_to_intermediate`, called earlier in the
-    /// same frame before the main encoder existed — into the main render
-    /// target, one `PathSprite` quad per path. Called *during* the main
-    /// encoder, alongside the other `draw_*` methods.
+    /// Composites this batch's slice of the shared intermediate texture —
+    /// just rasterized by `draw_paths_to_intermediate`, in the render pass
+    /// `draw_batches` ran immediately before reopening the main encoder —
+    /// into that main render target, one `PathSprite` quad per path.
     ///
     /// Simplification not present in `MetalRenderer`: always emits one
     /// sprite per path, rather than reasoning about draw order to sometimes
     /// merge several into a single spanning-rect copy (see
     /// `MetalRenderer::draw_paths_from_intermediate`'s comment on why it
     /// does that — "each pixel must only be copied once, in case of
-    /// transparent paths"). Two *different-order* paths whose bounds
-    /// overlap would get composited, and blended against the destination,
-    /// once each here, which can double-blend the overlap region — a real,
-    /// known gap, acceptable for now because it only matters for
-    /// overlapping paths, and every primitive this renderer draws already
-    /// ignores real scene z-order between *types* anyway (see the module
-    /// doc comment).
+    /// transparent paths"). Two *different-order* paths in the same batch
+    /// whose bounds overlap would get composited, and blended against the
+    /// destination, once each here, which can double-blend the overlap
+    /// region — a real, known gap, acceptable for now because it only
+    /// matters for overlapping transparent paths that also happen to fall
+    /// in the same contiguous paint-order run.
     fn draw_paths_from_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
@@ -1734,11 +2120,10 @@ impl Metal4Renderer {
         let texture: Retained<ProtocolObject<dyn MTLTexture>> =
             unsafe { bridge_retain(intermediate_texture.as_ptr() as *mut c_void) };
 
-        // Unconditional, unlike the atlas-texture caching in
-        // draw_monochrome_sprites/draw_polychrome_sprites: paths are
-        // composited at most once per frame, so there's no repeated-call
-        // thrashing to avoid here.
-        unsafe {
+        // Idempotent even though this can now run more than once per frame
+        // (one `Paths` batch's worth each time): residency-set membership is
+        // additive, so re-adding an already-resident texture is harmless.
+        {
             self.residency_set.addAllocation(texture.as_ref());
             self.residency_set.commit();
             self.residency_set.requestResidency();
@@ -1751,35 +2136,26 @@ impl Metal4Renderer {
             })
             .collect();
 
-        {
-            let mut path_sprites_buffer = self.path_sprites_buffer.borrow_mut();
-            if sprites.len() > path_sprites_buffer.1 {
-                let new_capacity = sprites.len().next_power_of_two();
-                let new_buffer = Self::new_buffer(
-                    &self.mtl4_device,
-                    mem::size_of::<PathSprite>() * new_capacity,
-                );
-                unsafe {
-                    self.residency_set
-                        .removeAllocation(path_sprites_buffer.0.as_ref());
-                    self.residency_set.addAllocation(new_buffer.as_ref());
-                    self.residency_set.commit();
-                    self.residency_set.requestResidency();
-                }
-                *path_sprites_buffer = (new_buffer, new_capacity);
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    sprites.as_ptr(),
-                    path_sprites_buffer.0.contents().as_ptr() as *mut PathSprite,
-                    sprites.len(),
-                );
-            }
-        }
-        let path_sprites_buffer = self.path_sprites_buffer.borrow();
-
+        // `draw_batches` already grew `path_sprites_buffer` to fit
+        // `scene.paths.len()` via `ensure_capacity`, so — same reasoning as
+        // `draw_paths_to_intermediate`'s vertex write — this only ever
+        // appends at the current cursor, never overwriting an earlier
+        // `Paths` batch's still-unread sprites this frame.
+        let slot = self.current_slot.get();
+        let base_sprite = self.path_sprites_cursor.get();
+        self.path_sprites_cursor.set(base_sprite + sprites.len());
+        let path_sprites_buffer = self.path_sprites_buffer[slot].borrow();
         unsafe {
-            self.viewport_size_buffer
+            std::ptr::copy_nonoverlapping(
+                sprites.as_ptr(),
+                (path_sprites_buffer.0.contents().as_ptr() as *mut PathSprite).add(base_sprite),
+                sprites.len(),
+            );
+        }
+
+        let viewport_size_buffer = &self.viewport_size_buffer[slot];
+        unsafe {
+            viewport_size_buffer
                 .contents()
                 .cast::<ViewportSize>()
                 .as_ptr()
@@ -1795,7 +2171,7 @@ impl Metal4Renderer {
             self.argument_table
                 .setAddress_atIndex(path_sprites_buffer.0.gpuAddress(), 1);
             self.argument_table
-                .setAddress_atIndex(self.viewport_size_buffer.gpuAddress(), 2);
+                .setAddress_atIndex(viewport_size_buffer.gpuAddress(), 2);
             self.argument_table
                 .setTexture_atIndex(texture.gpuResourceID(), 4);
             encoder.setArgumentTable_atStages(
@@ -1803,11 +2179,12 @@ impl Metal4Renderer {
                 MTLRenderStages::Vertex | MTLRenderStages::Fragment,
             );
             encoder.setRenderPipelineState(&self.path_sprite_pipeline_state);
-            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+            encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
                 MTLPrimitiveType::Triangle,
                 0,
                 6,
                 sprites.len(),
+                base_sprite,
             );
         }
     }
@@ -1837,14 +2214,13 @@ impl Metal4Renderer {
             return;
         }
 
-        unsafe {
-            for texture in self.surface_textures_in_residency.borrow_mut().drain(..) {
-                self.residency_set.removeAllocation(texture.as_ref());
-            }
+        for texture in self.surface_textures_in_residency.borrow_mut().drain(..) {
+            self.residency_set.removeAllocation(texture.as_ref());
         }
 
+        let slot = self.current_slot.get();
         unsafe {
-            self.viewport_size_buffer
+            self.viewport_size_buffer[slot]
                 .contents()
                 .cast::<ViewportSize>()
                 .as_ptr()
@@ -1905,17 +2281,16 @@ impl Metal4Renderer {
             // if slightly conservative, way to hold our own reference.
             let y_texture: Retained<ProtocolObject<dyn MTLTexture>> = unsafe {
                 bridge_retain(
-                    CVMetalTextureGetTexture(y_texture_cv.as_concrete_TypeRef()) as *mut c_void,
+                    CVMetalTextureGetTexture(y_texture_cv.as_concrete_TypeRef()) as *mut c_void
                 )
             };
             let cb_cr_texture: Retained<ProtocolObject<dyn MTLTexture>> = unsafe {
                 bridge_retain(
-                    CVMetalTextureGetTexture(cb_cr_texture_cv.as_concrete_TypeRef())
-                        as *mut c_void,
+                    CVMetalTextureGetTexture(cb_cr_texture_cv.as_concrete_TypeRef()) as *mut c_void,
                 )
             };
 
-            unsafe {
+            {
                 self.residency_set.addAllocation(y_texture.as_ref());
                 self.residency_set.addAllocation(cb_cr_texture.as_ref());
                 self.residency_set.commit();
@@ -1935,7 +2310,9 @@ impl Metal4Renderer {
                     self.surfaces_buffer.borrow().contents().as_ptr() as *mut SurfaceBounds,
                     1,
                 );
-                self.atlas_size_buffer
+                self.atlas_size_buffer[slot]
+                    .borrow()
+                    .0
                     .contents()
                     .cast::<ViewportSize>()
                     .as_ptr()
@@ -1949,9 +2326,9 @@ impl Metal4Renderer {
                 self.argument_table
                     .setAddress_atIndex(self.surfaces_buffer.borrow().gpuAddress(), 1);
                 self.argument_table
-                    .setAddress_atIndex(self.viewport_size_buffer.gpuAddress(), 2);
+                    .setAddress_atIndex(self.viewport_size_buffer[slot].gpuAddress(), 2);
                 self.argument_table
-                    .setAddress_atIndex(self.atlas_size_buffer.gpuAddress(), 3);
+                    .setAddress_atIndex(self.atlas_size_buffer[slot].borrow().0.gpuAddress(), 3);
                 self.argument_table
                     .setTexture_atIndex(y_texture.gpuResourceID(), 4);
                 self.argument_table
@@ -2052,7 +2429,9 @@ mod tests {
 
         let mut scene = Scene::default();
         scene.quads.push(make_quad(20.0, 20.0, 150.0, 150.0, red));
-        scene.quads.push(make_quad(225.0, 20.0, 150.0, 150.0, green));
+        scene
+            .quads
+            .push(make_quad(225.0, 20.0, 150.0, 150.0, green));
         scene.quads.push(make_quad(430.0, 20.0, 150.0, 150.0, blue));
 
         let mut renderer = Metal4Renderer::new_headless();
@@ -2126,7 +2505,10 @@ mod tests {
         image
             .save(&out_path)
             .expect("failed to save metal4 underline test PNG");
-        eprintln!("metal4 underline test image written to {}", out_path.display());
+        eprintln!(
+            "metal4 underline test image written to {}",
+            out_path.display()
+        );
 
         assert_pixel_matches(&image, 200, 41, yellow, "underline, mid-span");
         assert_pixel_matches(&image, 60, 41, yellow, "underline, near left end");
@@ -2238,7 +2620,10 @@ mod tests {
         let tile = renderer
             .sprite_atlas()
             .get_or_insert_with(key, &mut || {
-                Ok(Some((tile_size, std::borrow::Cow::Borrowed(opaque_pixels.as_slice()))))
+                Ok(Some((
+                    tile_size,
+                    std::borrow::Cow::Borrowed(opaque_pixels.as_slice()),
+                )))
             })
             .expect("atlas upload failed")
             .expect("atlas upload returned no tile");
@@ -2326,7 +2711,10 @@ mod tests {
         let tile = renderer
             .sprite_atlas()
             .get_or_insert_with(key, &mut || {
-                Ok(Some((tile_size, std::borrow::Cow::Borrowed(pixels.as_slice()))))
+                Ok(Some((
+                    tile_size,
+                    std::borrow::Cow::Borrowed(pixels.as_slice()),
+                )))
             })
             .expect("atlas upload failed")
             .expect("atlas upload returned no tile");
@@ -2406,7 +2794,10 @@ mod tests {
         path.content_mask = gpui::ContentMask {
             bounds: Bounds::new(
                 Point::default(),
-                size(gpui::px(canvas.width as f32), gpui::px(canvas.height as f32)),
+                size(
+                    gpui::px(canvas.width as f32),
+                    gpui::px(canvas.height as f32),
+                ),
             ),
         };
         let path = path.scale(1.0);
@@ -2433,8 +2824,20 @@ mod tests {
         assert_pixel_matches(&image, 100, 100, magenta, "triangle interior");
 
         let black = hsla(0.0, 0.0, 0.0, 1.0);
-        assert_pixel_matches(&image, 10, 10, black, "outside the triangle, top-left corner");
-        assert_pixel_matches(&image, 190, 190, black, "outside the triangle, bottom-right corner");
+        assert_pixel_matches(
+            &image,
+            10,
+            10,
+            black,
+            "outside the triangle, top-left corner",
+        );
+        assert_pixel_matches(
+            &image,
+            190,
+            190,
+            black,
+            "outside the triangle, bottom-right corner",
+        );
         assert_pixel_matches(&image, 100, 190, black, "below the triangle's apex");
     }
 
@@ -2528,7 +2931,10 @@ mod tests {
         image
             .save(&out_path)
             .expect("failed to save metal4 surface test PNG");
-        eprintln!("metal4 surface test image written to {}", out_path.display());
+        eprintln!(
+            "metal4 surface test image written to {}",
+            out_path.display()
+        );
 
         let white = hsla(0.0, 0.0, 1.0, 1.0);
         assert_pixel_matches(&image, 100, 100, white, "surface center");

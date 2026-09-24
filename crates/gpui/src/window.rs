@@ -8127,6 +8127,7 @@ mod tests {
                 bottom: px(350.),
                 ..Default::default()
             },
+            ..Default::default()
         });
         assert!(platform_window.frame_wake_count() > wakes);
         window

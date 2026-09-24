@@ -35,9 +35,10 @@ use objc2_ui_kit::{
     UIResponderStandardEditActions, UIStatusBarStyle,
 };
 use objc2_ui_kit::{
-    UIEditMenuConfiguration, UIEditMenuInteraction, UIEvent, UIScreen, UITouch, UITraitCollection,
-    UITraitEnvironment, UIUserInterfaceStyle, UIView, UIViewAutoresizing, UIViewController,
-    UIWindow, UIWindowScene,
+    UIEdgeInsets, UIEditMenuConfiguration, UIEditMenuInteraction, UIEvent, UIScreen, UITouch,
+    UITraitCollection, UITraitEnvironment, UIUserInterfaceStyle, UIView, UIViewAutoresizing,
+    UIViewController, UIViewLayoutRegion, UIViewLayoutRegionAdaptivityAxis, UIWindow,
+    UIWindowScene,
 };
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, UiKitDisplayHandle, UiKitWindowHandle};
@@ -616,9 +617,54 @@ impl IosWindowState {
         )
     }
 
+    /// Whether the window fills the whole screen. It does on an iPhone and for an iPad app that is
+    /// not windowed; a Stage Manager window that has been resized (or moved) does not.
+    fn covers_screen(&self) -> bool {
+        let screen = IosDisplay::main().bounds().size;
+        let size = self.bounds.get().size;
+        size.width >= screen.width - px(1.) && size.height >= screen.height - px(1.)
+    }
+
+    /// The space the system's window controls take up over the content (`(top, bottom, left,
+    /// right)`): the corner-adapted safe-area layout regions (iOS 26) minus the plain safe area.
+    /// The horizontal-axis region says how far content has to move sideways to clear the
+    /// controls, the vertical-axis one how far down. Zero on older systems, which lack the API.
+    fn window_controls_insets(&self) -> (f32, f32, f32, f32) {
+        let selector = sel!(edgeInsetsForLayoutRegion:);
+        if !self.view.respondsToSelector(selector) {
+            return (0., 0., 0., 0.);
+        }
+        let horizontal_region = UIViewLayoutRegion::safeAreaLayoutRegionWithCornerAdaptation(
+            UIViewLayoutRegionAdaptivityAxis::Horizontal,
+        );
+        let vertical_region = UIViewLayoutRegion::safeAreaLayoutRegionWithCornerAdaptation(
+            UIViewLayoutRegionAdaptivityAxis::Vertical,
+        );
+        // SAFETY: the selector was just checked; it takes a layout region and returns UIEdgeInsets.
+        let horizontal: UIEdgeInsets =
+            unsafe { msg_send![&*self.view, edgeInsetsForLayoutRegion: &*horizontal_region] };
+        let vertical: UIEdgeInsets =
+            unsafe { msg_send![&*self.view, edgeInsetsForLayoutRegion: &*vertical_region] };
+        let safe = self.view.safeAreaInsets();
+        (
+            (vertical.top - safe.top).max(0.) as f32,
+            (vertical.bottom - safe.bottom).max(0.) as f32,
+            (horizontal.left - safe.left).max(0.) as f32,
+            (horizontal.right - safe.right).max(0.) as f32,
+        )
+    }
+
     fn current_insets(&self) -> WindowInsets {
         let (top, bottom, left, right) = self.safe_area_insets();
+        let (controls_top, controls_bottom, controls_left, controls_right) =
+            self.window_controls_insets();
         WindowInsets {
+            window_controls: Edges {
+                top: px(controls_top),
+                right: px(controls_right),
+                bottom: px(controls_bottom),
+                left: px(controls_left),
+            },
             safe_area: Edges {
                 top: px(top),
                 right: px(right),
@@ -633,8 +679,17 @@ impl IosWindowState {
     }
 
     fn notify_insets_changed(&self) {
-        self.insets_changed_callback
-            .with(|callback| callback(self.current_insets()));
+        let insets = self.current_insets();
+        // Fires on every layout pass (each frame while a window is being resized), so trace only.
+        log::trace!(
+            "GPUI iOS: insets — safe {:?}, window controls {:?}; window {:?} on screen {:?} (covers: {})",
+            insets.safe_area,
+            insets.window_controls,
+            self.bounds.get().size,
+            IosDisplay::main().bounds().size,
+            self.covers_screen()
+        );
+        self.insets_changed_callback.with(|callback| callback(insets));
     }
 
     fn notify_appearance_changed(&self) {
@@ -822,7 +877,7 @@ impl PlatformWindow for IosWindow {
     }
 
     fn is_maximized(&self) -> bool {
-        true // iOS windows are always "maximized"
+        self.covers_screen()
     }
 
     fn window_bounds(&self) -> WindowBounds {
@@ -924,7 +979,7 @@ impl PlatformWindow for IosWindow {
     }
 
     fn is_fullscreen(&self) -> bool {
-        true
+        self.covers_screen()
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {

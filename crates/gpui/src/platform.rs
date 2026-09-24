@@ -849,6 +849,13 @@ pub struct WindowInsets {
     /// (iOS: derived from `keyboardWillShow`/frame-change notifications.
     /// Android: `WindowInsets.Type.ime()`.)
     pub ime: Edges<Pixels>,
+    /// Space taken by the system's window controls where they float over the window's content
+    /// rather than sit in a title bar of their own (iPadOS windowed mode: the close / minimise /
+    /// zoom buttons at the top left). Unlike [`Self::safe_area`] this is not part of
+    /// [`Self::effective`]: an application decides where to make room, e.g. pad a sidebar's top by
+    /// `top`, or a header's leading edge by `left`. (iOS: the corner-adapted layout regions minus
+    /// the safe area, iOS 26+; zero everywhere else.)
+    pub window_controls: Edges<Pixels>,
 }
 
 impl WindowInsets {

@@ -282,7 +282,7 @@ pub(super) fn build(builder: &ProtocolObject<dyn UIMenuBuilder>, mtm: MainThread
             // removing it and inserting our own menu in its place works.
             let counterpart = system.iter().enumerate().find(|(index, (identifier, system_title))| {
                 !claimed[*index]
-                    && **identifier != file_menu
+                    && **identifier != *file_menu
                     && system_title.trim().eq_ignore_ascii_case(title.trim())
             });
             let Some((index, (identifier, _))) = counterpart else {

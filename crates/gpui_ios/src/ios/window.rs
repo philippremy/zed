@@ -28,7 +28,7 @@ use objc2::{
     ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSArray, NSNotification, NSNotificationCenter, NSObjectProtocol, NSSet, NSValue};
+use objc2_foundation::{NSString, NSArray, NSNotification, NSNotificationCenter, NSObjectProtocol, NSSet, NSValue};
 use objc2_quartz_core::CAMetalLayer;
 use objc2_ui_kit::{
     NSValueUIGeometryExtensions, UIKeyboardFrameEndUserInfoKey,
@@ -37,6 +37,7 @@ use objc2_ui_kit::{
 };
 use objc2_ui_kit::{
     UICoordinateSpace, UIEdgeInsets, UIEditMenuConfiguration, UIEditMenuInteraction, UIEvent,
+    UIAlertAction, UIAlertActionStyle, UIAlertController, UIAlertControllerStyle,
     UIGestureRecognizerState, UIHoverGestureRecognizer, UIPanGestureRecognizer,
     UIPinchGestureRecognizer, UIScreen, UIScrollTypeMask, UITouch,
     UITraitCollection, UITraitEnvironment, UIUserInterfaceStyle, UIView, UIViewAutoresizing,
@@ -1096,12 +1097,50 @@ impl PlatformWindow for IosWindow {
 
     fn prompt(
         &self,
-        _level: PromptLevel,
-        _msg: &str,
-        _detail: Option<&str>,
-        _answers: &[PromptButton],
+        level: PromptLevel,
+        msg: &str,
+        detail: Option<&str>,
+        answers: &[PromptButton],
     ) -> Option<futures::channel::oneshot::Receiver<usize>> {
-        None
+        let mtm = MainThreadMarker::new()?;
+        let presenter = super::IosPlatform::presented_view_controller()?;
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        let sender = Rc::new(RefCell::new(Some(sender)));
+
+        let alert = UIAlertController::alertControllerWithTitle_message_preferredStyle(
+            Some(&NSString::from_str(msg)),
+            detail.map(NSString::from_str).as_deref(),
+            UIAlertControllerStyle::Alert,
+            mtm,
+        );
+        // Only the first button of a critical prompt is the destructive one (the app lists the
+        // confirming action first); an explicit cancel button gets the system's cancel styling.
+        for (index, answer) in answers.iter().enumerate() {
+            let style = if answer.is_cancel() {
+                UIAlertActionStyle::Cancel
+            } else if level == PromptLevel::Critical && index == 0 {
+                UIAlertActionStyle::Destructive
+            } else {
+                UIAlertActionStyle::Default
+            };
+            let sender = sender.clone();
+            let handler = block2::RcBlock::new(move |_action: NonNull<UIAlertAction>| {
+                if let Some(sender) = sender.borrow_mut().take() {
+                    if sender.send(index).is_err() {
+                        log::debug!("GPUI iOS: prompt receiver was dropped");
+                    }
+                }
+            });
+            let action = UIAlertAction::actionWithTitle_style_handler(
+                Some(&NSString::from_str(answer.label())),
+                style,
+                Some(&handler),
+                mtm,
+            );
+            alert.addAction(&action);
+        }
+        presenter.presentViewController_animated_completion(&alert, true, None);
+        Some(receiver)
     }
 
     fn activate(&self) {

@@ -5,16 +5,14 @@
 //! owns GPU resources and shaders while leaving application lifecycle,
 //! windowing, and input to each platform backend.
 
-<<<<<<< HEAD
+mod dispatcher;
+#[cfg(target_os = "macos")]
 mod metal4_capability;
+#[cfg(target_os = "macos")]
 mod metal4_renderer;
 mod metal_atlas;
 pub mod metal_renderer;
+#[cfg(target_os = "macos")]
 pub mod renderer_select;
-=======
-mod dispatcher;
-mod metal_atlas;
-pub mod metal_renderer;
 
 pub use dispatcher::{AppleDispatcher, MacActivity};
->>>>>>> ios-pr

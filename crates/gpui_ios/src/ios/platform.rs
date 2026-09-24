@@ -79,7 +79,7 @@ impl IosPlatform {
         window.rootViewController()
     }
 
-    fn presented_view_controller() -> Option<Retained<UIViewController>> {
+    pub(super) fn presented_view_controller() -> Option<Retained<UIViewController>> {
         let mut view_controller = Self::root_view_controller()?;
         while let Some(presented) = view_controller.presentedViewController() {
             view_controller = presented;
@@ -243,11 +243,14 @@ impl Platform for IosPlatform {
 
     fn prompt_for_paths(
         &self,
-        _options: PathPromptOptions,
+        options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
+        if options.files && !options.directories {
+            return super::documents::pick_files(&[], options.multiple);
+        }
         let (tx, rx) = oneshot::channel();
         if tx
-            .send(Err(anyhow!("File picker not yet implemented for iOS")))
+            .send(Err(anyhow!("Choosing folders is not supported on iOS")))
             .is_err()
         {
             log::debug!("GPUI iOS: File picker receiver was dropped");
@@ -262,7 +265,10 @@ impl Platform for IosPlatform {
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
         let (tx, rx) = oneshot::channel();
         if tx
-            .send(Err(anyhow!("Save dialog not yet implemented for iOS")))
+            .send(Err(anyhow!(
+                "iOS has no save panel: write the file inside the app and call \
+                 gpui_ios::ios::documents::export_files"
+            )))
             .is_err()
         {
             log::debug!("GPUI iOS: Save dialog receiver was dropped");

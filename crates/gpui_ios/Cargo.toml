@@ -45,6 +45,7 @@ objc2-quartz-core.workspace = true
 objc2-core-foundation = { workspace = true, default-features = true }
 objc2-core-text.workspace = true
 objc2-security.workspace = true
+objc2-uniform-type-identifiers.workspace = true
 parking_lot.workspace = true
 pathfinder_geometry.workspace = true
 raw-window-handle.workspace = true

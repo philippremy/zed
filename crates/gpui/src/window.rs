@@ -5072,6 +5072,30 @@ impl Window {
             .request_measured_layout(style, rem_size, scale_factor, measure)
     }
 
+    /// Like [`Self::request_measured_layout`], with a `content_key` covering everything the
+    /// closure's result depends on besides the available space. A node with the same key, style
+    /// and children as one from the previous frame is reused together with its layout cache, and
+    /// the new closure is replayed against the old inputs so per-frame element state is rebuilt.
+    pub fn request_measured_layout_keyed<F>(
+        &mut self,
+        style: Style,
+        content_key: u64,
+        measure: F,
+    ) -> LayoutId
+    where
+        F: Fn(Size<Option<Pixels>>, Size<AvailableSpace>, &mut Window, &mut App) -> Size<Pixels>
+            + 'static,
+    {
+        self.invalidator.debug_assert_prepaint();
+
+        let rem_size = self.rem_size();
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .request_measured_layout_keyed(style, rem_size, scale_factor, Some(content_key), measure)
+    }
+
     /// Compute the layout for the given id within the given available space.
     /// This method is called for its side effect, typically by the framework prior to painting.
     /// After calling it, you can request the bounds of the given layout node id or any descendant.

@@ -27,7 +27,34 @@ type NodeMeasureFn = StackSafe<Box<MeasureFn>>;
 
 struct NodeContext {
     measure: NodeMeasureFn,
+    /// The most recent (known dimensions, available space) taffy asked this leaf to measure
+    /// with, in device pixels. Replayed into the *current* frame's measure closure when the
+    /// node is reused without taffy re-measuring it (see `TaffyLayoutEngine::pending_remeasure`).
+    last_args: Option<(TaffySize<Option<f32>>, TaffySize<TaffyAvailableSpace>)>,
 }
+/// Perf instrumentation: (frames, nodes, layout ns, measure calls, measure ns).
+static STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Returns and resets the layout counters since the last call.
+static STATS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns the layout counters on (off by default: they add per-call overhead).
+pub fn enable_layout_stats(on: bool) {
+    STATS_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn take_layout_stats() -> [u64; 5] {
+    std::array::from_fn(|i| STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Perf instrumentation: (duration ns, subtree node count) per compute_layout call.
+pub static CALLS: std::sync::Mutex<Vec<(u64, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Drains the per-call records.
+pub fn take_layout_calls() -> Vec<(u64, u32)> {
+    std::mem::take(&mut *CALLS.lock().unwrap())
+}
+
 pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
@@ -35,6 +62,111 @@ pub struct TaffyLayoutEngine {
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
     computed_layouts: FxHashSet<LayoutId>,
     layout_bounds_scratch_space: Vec<LayoutId>,
+
+    // Retained layout. gpui rebuilds its element tree every frame, which used to mean rebuilding
+    // the taffy tree from scratch too, so taffy's per-node layout cache never survived a frame
+    // and every frame was a full relayout. Instead, nodes are hash-consed across frames: a node
+    // requested with the same style, the same (themselves reused) children and, for measured
+    // leaves, the same content key as a node from the previous frame *is* that node, cache and
+    // all. Only nodes whose inputs changed (and their ancestors) are recomputed.
+    retain: bool,
+    /// Previous frame's nodes by structural key, available for reuse this frame.
+    pool: FxHashMap<u64, Vec<NodeId>>,
+    /// Nodes handed out this frame (created or reused) with their key, `0` = not poolable.
+    live: Vec<(u64, NodeId)>,
+    /// Reused measured leaves that taffy may not re-measure (a layout cache hit skips the
+    /// callback). Their fresh closure is replayed with `last_args` so per-frame element state
+    /// (e.g. shaped text) is populated for paint.
+    pending_remeasure: Vec<NodeId>,
+    /// `DTB_KE_LAYOUT_VERIFY=1`: after every layout, recompute from scratch and compare.
+    verify: bool,
+    /// (created, reused) node counts since the last `take_reuse_stats`.
+    reuse_counts: (u64, u64),
+}
+
+/// Perf instrumentation: (nodes created, nodes reused) since the last call.
+pub static REUSE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Returns and resets taffy's (cache hits, cache misses) counters.
+pub fn take_taffy_cache_stats() -> (u64, u64) {
+    taffy::compute::take_cache_stats()
+}
+
+/// Returns and resets the (created, reused) node counters.
+pub fn take_reuse_stats() -> (u64, u64) {
+    (
+        REUSE[0].swap(0, std::sync::atomic::Ordering::Relaxed),
+        REUSE[1].swap(0, std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("false")),
+        Err(_) => default,
+    }
+}
+
+/// A cheap fingerprint of the layout-relevant parts of a style. Collisions are harmless — a
+/// candidate node is always verified with a full `==` — so this only needs to spread well.
+fn style_fingerprint(style: &taffy::Style) -> u64 {
+    use std::hash::{Hash, Hasher};
+    use std::mem::discriminant;
+    let mut h = collections::FxHasher::default();
+    let len = |c: taffy::style::CompactLength, h: &mut collections::FxHasher| {
+        c.tag().hash(h);
+        c.value().to_bits().hash(h);
+    };
+    discriminant(&style.display).hash(&mut h);
+    discriminant(&style.position).hash(&mut h);
+    discriminant(&style.flex_direction).hash(&mut h);
+    discriminant(&style.flex_wrap).hash(&mut h);
+    discriminant(&style.align_items).hash(&mut h);
+    discriminant(&style.align_self).hash(&mut h);
+    discriminant(&style.justify_content).hash(&mut h);
+    discriminant(&style.align_content).hash(&mut h);
+    discriminant(&style.overflow.x).hash(&mut h);
+    discriminant(&style.overflow.y).hash(&mut h);
+    style.flex_grow.to_bits().hash(&mut h);
+    style.flex_shrink.to_bits().hash(&mut h);
+    len(style.flex_basis.into_raw(), &mut h);
+    for d in [
+        style.size.width,
+        style.size.height,
+        style.min_size.width,
+        style.min_size.height,
+        style.max_size.width,
+        style.max_size.height,
+    ] {
+        len(d.into_raw(), &mut h);
+    }
+    for l in [
+        style.margin.left,
+        style.margin.right,
+        style.margin.top,
+        style.margin.bottom,
+        style.inset.left,
+        style.inset.right,
+        style.inset.top,
+        style.inset.bottom,
+    ] {
+        len(l.into_raw(), &mut h);
+    }
+    for l in [
+        style.padding.left,
+        style.padding.right,
+        style.padding.top,
+        style.padding.bottom,
+        style.border.left,
+        style.border.right,
+        style.border.top,
+        style.border.bottom,
+        style.gap.width,
+        style.gap.height,
+    ] {
+        len(l.into_raw(), &mut h);
+    }
+    h.finish()
 }
 
 const EXPECT_MESSAGE: &str = "we should avoid taffy layout errors by construction if possible";
@@ -49,14 +181,64 @@ impl TaffyLayoutEngine {
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
             layout_bounds_scratch_space: Vec::new(),
+            retain: env_flag("DTB_KE_LAYOUT_RETAIN", true),
+            pool: FxHashMap::default(),
+            live: Vec::new(),
+            pending_remeasure: Vec::new(),
+            verify: env_flag("DTB_KE_LAYOUT_VERIFY", false),
+            reuse_counts: (0, 0),
         }
     }
 
     pub fn clear(&mut self) {
-        self.taffy.clear();
+        if self.retain {
+            // Sweep: whatever last frame's pool still holds was not reused this frame.
+            for (_, nodes) in self.pool.drain() {
+                for node in nodes {
+                    self.taffy.remove_detached(node);
+                }
+            }
+            for (key, node) in self.live.drain(..) {
+                if key != 0 {
+                    self.pool.entry(key).or_default().push(node);
+                }
+            }
+            self.pending_remeasure.clear();
+        } else {
+            self.taffy.clear();
+        }
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
         self.computed_layouts.clear();
+    }
+
+    /// Takes a reusable node out of last frame's pool, if one has exactly this key.
+    fn take_reusable(
+        &mut self,
+        key: u64,
+        style: &taffy::Style,
+        children: &[LayoutId],
+        measured: bool,
+    ) -> Option<NodeId> {
+        let bucket = self.pool.get_mut(&key)?;
+        let position = bucket.iter().position(|&candidate| {
+            self.taffy.get_node_context(candidate).is_some() == measured
+                && self.taffy.style(candidate).is_ok_and(|s| s == style)
+                && self.taffy.child_ids(candidate).eq(LayoutId::to_taffy_slice(children).iter().copied())
+        })?;
+        Some(bucket.swap_remove(position))
+    }
+
+    fn structural_key(style: &taffy::Style, children: &[LayoutId], content_key: u64) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = collections::FxHasher::default();
+        style_fingerprint(style).hash(&mut h);
+        content_key.hash(&mut h);
+        for child in children {
+            child.hash(&mut h);
+        }
+        // `0` is reserved for "not poolable".
+        h.finish() | 1
     }
 
     pub fn request_layout(
@@ -68,18 +250,29 @@ impl TaffyLayoutEngine {
     ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
 
-        if children.is_empty() {
-            self.taffy
-                .new_leaf(taffy_style)
-                .expect(EXPECT_MESSAGE)
-                .into()
+        let mut key = 0;
+        if self.retain {
+            key = Self::structural_key(&taffy_style, children, 0);
+            if let Some(node) = self.take_reusable(key, &taffy_style, children, false) {
+                self.live.push((key, node));
+                self.reuse_counts.1 += 1;
+                return node.into();
+            }
+        }
+
+        let node = if children.is_empty() {
+            self.taffy.new_leaf(taffy_style).expect(EXPECT_MESSAGE)
         } else {
+            // A reused child still lists its previous (now dead) parent; re-parenting is done by
+            // `new_with_children`, and `remove_detached` never clobbers the new link.
             self.taffy
                 // This is safe because LayoutId is repr(transparent) to taffy::tree::NodeId.
                 .new_with_children(taffy_style, LayoutId::to_taffy_slice(children))
                 .expect(EXPECT_MESSAGE)
-                .into()
-        }
+        };
+        self.live.push((key, node));
+        self.reuse_counts.0 += 1;
+        node.into()
     }
 
     pub fn request_measured_layout(
@@ -95,15 +288,63 @@ impl TaffyLayoutEngine {
         ) -> Size<Pixels>
         + 'static,
     ) -> LayoutId {
+        self.request_measured_layout_keyed(style, rem_size, scale_factor, None, measure)
+    }
+
+    /// Like [`Self::request_measured_layout`], but with a `content_key` that must change whenever
+    /// anything the measure closure depends on (other than the available space, which taffy's own
+    /// cache already accounts for) changes. Nodes with a key are reused across frames.
+    pub fn request_measured_layout_keyed(
+        &mut self,
+        style: Style,
+        rem_size: Pixels,
+        scale_factor: f32,
+        content_key: Option<u64>,
+        measure: impl FnMut(
+            Size<Option<Pixels>>,
+            Size<AvailableSpace>,
+            &mut Window,
+            &mut App,
+        ) -> Size<Pixels>
+        + 'static,
+    ) -> LayoutId {
         let taffy_style = style.to_taffy(rem_size, scale_factor);
         let measure = Box::new(measure) as Box<MeasureFn>;
         #[cfg(feature = "stacker")]
         let measure = StackSafe::new(measure);
 
-        self.taffy
-            .new_leaf_with_context(taffy_style, NodeContext { measure })
-            .expect(EXPECT_MESSAGE)
-            .into()
+        let mut key = 0;
+        if self.retain
+            && let Some(content_key) = content_key
+        {
+            key = Self::structural_key(&taffy_style, &[], content_key);
+            if let Some(node) = self.take_reusable(key, &taffy_style, &[], true) {
+                // Keep the node (and its layout cache) but swap in this frame's closure, which
+                // owns this frame's element state.
+                self.taffy
+                    .get_node_context_mut(node)
+                    .expect("reused measured node has a context")
+                    .measure = measure;
+                self.pending_remeasure.push(node);
+                self.live.push((key, node));
+                self.reuse_counts.1 += 1;
+                return node.into();
+            }
+        }
+
+        let node = self
+            .taffy
+            .new_leaf_with_context(
+                taffy_style,
+                NodeContext {
+                    measure,
+                    last_args: None,
+                },
+            )
+            .expect(EXPECT_MESSAGE);
+        self.live.push((key, node));
+        self.reuse_counts.0 += 1;
+        node.into()
     }
 
     /// Treats any `auto` dimension of the given node's style as filling `size`.
@@ -232,6 +473,51 @@ impl TaffyLayoutEngine {
             transform(available_space.height),
         );
 
+        use std::sync::atomic::Ordering::Relaxed;
+        let stats = STATS_ENABLED.load(Relaxed);
+        if stats {
+            STATS[0].fetch_add(1, Relaxed);
+            STATS[1].fetch_add(self.taffy.total_node_count() as u64, Relaxed);
+
+            REUSE[0].fetch_add(std::mem::take(&mut self.reuse_counts.0), Relaxed);
+            REUSE[1].fetch_add(std::mem::take(&mut self.reuse_counts.1), Relaxed);
+        }
+
+        // Reused measured leaves: taffy will skip the measure callback on a layout-cache hit, but
+        // paint needs this frame's element state (shaped text) populated, so replay each one's
+        // last known measure inputs through the fresh closure.
+        for node in std::mem::take(&mut self.pending_remeasure) {
+            if let Some(context) = self.taffy.get_node_context_mut(node)
+                && let Some((known, available)) = context.last_args
+            {
+                measure_node(context, known, available, scale_factor, window, cx);
+            }
+        }
+
+        let started = std::time::Instant::now();
+        self.run_layout(id, available_space, scale_factor, stats, window, cx);
+
+        if self.verify {
+            self.verify_against_scratch(id, available_space, scale_factor, window, cx);
+        }
+        if stats {
+            let ns = started.elapsed().as_nanos() as u64;
+            STATS[2].fetch_add(ns, Relaxed);
+            let subtree = self.count_all_children(id).unwrap_or(0) + 1;
+            CALLS.lock().unwrap().push((ns, subtree));
+        }
+    }
+
+    fn run_layout(
+        &mut self,
+        id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        scale_factor: f32,
+        stats: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
         self.taffy
             .compute_layout_with_measure(
                 id.into(),
@@ -240,31 +526,76 @@ impl TaffyLayoutEngine {
                     let Some(node_context) = node_context else {
                         return taffy::geometry::Size::default();
                     };
-
-                    let known_dimensions = Size {
-                        width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
-                        height: known_dimensions.height.map(|e| Pixels(e / scale_factor)),
-                    };
-
-                    let available_space: Size<AvailableSpace> = available_space.into();
-                    let untransform = |ev: AvailableSpace| match ev {
-                        AvailableSpace::Definite(pixels) => {
-                            AvailableSpace::Definite(Pixels(pixels.0 / scale_factor))
-                        }
-                        AvailableSpace::MinContent => AvailableSpace::MinContent,
-                        AvailableSpace::MaxContent => AvailableSpace::MaxContent,
-                    };
-                    let available_space = size(
-                        untransform(available_space.width),
-                        untransform(available_space.height),
+                    node_context.last_args = Some((known_dimensions, available_space));
+                    let m_start = stats.then(std::time::Instant::now);
+                    let measured = measure_node(
+                        node_context,
+                        known_dimensions,
+                        available_space,
+                        scale_factor,
+                        window,
+                        cx,
                     );
-
-                    let measured_size: Size<Pixels> =
-                        (node_context.measure)(known_dimensions, available_space, window, cx);
-                    snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                    if let Some(m_start) = m_start {
+                        STATS[3].fetch_add(1, Relaxed);
+                        STATS[4].fetch_add(m_start.elapsed().as_nanos() as u64, Relaxed);
+                    }
+                    measured
                 },
             )
             .expect(EXPECT_MESSAGE);
+    }
+
+    /// `DTB_KE_LAYOUT_VERIFY=1`: throw away every cached result under `id`, recompute from
+    /// scratch, and log any node whose layout differs from the incrementally computed one.
+    fn verify_against_scratch(
+        &mut self,
+        id: LayoutId,
+        available_space: Size<AvailableSpace>,
+        scale_factor: f32,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let mut nodes = Vec::new();
+        let mut stack = vec![NodeId::from(id)];
+        while let Some(node) = stack.pop() {
+            nodes.push(node);
+            stack.extend(self.taffy.child_ids(node));
+        }
+        let before: Vec<taffy::Layout> = nodes
+            .iter()
+            .map(|n| *self.taffy.layout(*n).expect(EXPECT_MESSAGE))
+            .collect();
+        for node in &nodes {
+            self.taffy.mark_dirty(*node).expect(EXPECT_MESSAGE);
+        }
+        self.run_layout(id, available_space, scale_factor, false, window, cx);
+        let mut bad = 0;
+        for (node, old) in nodes.iter().zip(&before) {
+            let new = self.taffy.layout(*node).expect(EXPECT_MESSAGE);
+            let close = |a: f32, b: f32| (a - b).abs() < 0.01;
+            if !(close(old.size.width, new.size.width)
+                && close(old.size.height, new.size.height)
+                && close(old.location.x, new.location.x)
+                && close(old.location.y, new.location.y))
+            {
+                if bad < 5 {
+                    log::error!(
+                        "layout verify: node {node:?} differs — retained {:?}/{:?}, scratch {:?}/{:?}",
+                        old.location,
+                        old.size,
+                        new.location,
+                        new.size
+                    );
+                }
+                bad += 1;
+            }
+        }
+        if bad > 0 {
+            log::error!("layout verify: {bad}/{} nodes differ from a scratch layout", nodes.len());
+        } else {
+            log::debug!("layout verify: {} nodes OK", nodes.len());
+        }
     }
 
     // Pixel snapping
@@ -407,6 +738,33 @@ impl From<LayoutId> for NodeId {
     fn from(layout_id: LayoutId) -> NodeId {
         layout_id.0
     }
+}
+
+/// Invokes a node's measure closure with taffy's device-pixel inputs, returning device pixels.
+fn measure_node(
+    context: &mut NodeContext,
+    known_dimensions: TaffySize<Option<f32>>,
+    available_space: TaffySize<TaffyAvailableSpace>,
+    scale_factor: f32,
+    window: &mut Window,
+    cx: &mut App,
+) -> TaffySize<f32> {
+    let known_dimensions = Size {
+        width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
+        height: known_dimensions.height.map(|e| Pixels(e / scale_factor)),
+    };
+    let available_space: Size<AvailableSpace> = available_space.into();
+    let untransform = |ev: AvailableSpace| match ev {
+        AvailableSpace::Definite(pixels) => AvailableSpace::Definite(Pixels(pixels.0 / scale_factor)),
+        AvailableSpace::MinContent => AvailableSpace::MinContent,
+        AvailableSpace::MaxContent => AvailableSpace::MaxContent,
+    };
+    let available_space = size(
+        untransform(available_space.width),
+        untransform(available_space.height),
+    );
+    let measured_size: Size<Pixels> = (context.measure)(known_dimensions, available_space, window, cx);
+    snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
 }
 
 fn snap_measured_size_to_device_pixels(size: Size<Pixels>, scale_factor: f32) -> Size<f32> {

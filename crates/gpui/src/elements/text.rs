@@ -644,7 +644,27 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
-        window.request_measured_layout(Default::default(), {
+        // Everything the measure result depends on, bar the available space (which taffy's own
+        // cache tracks). Lets the layout engine reuse this node across frames.
+        let content_key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = collections::FxHasher::default();
+            text.hash(&mut h);
+            for run in &runs {
+                run.len.hash(&mut h);
+                run.font.hash(&mut h);
+            }
+            text_style.font().hash(&mut h);
+            font_size.0.to_bits().hash(&mut h);
+            line_height.0.to_bits().hash(&mut h);
+            std::mem::discriminant(&text_style.white_space).hash(&mut h);
+            text_style.line_clamp.hash(&mut h);
+            if let Some(overflow) = &text_style.text_overflow {
+                format!("{overflow:?}").hash(&mut h);
+            }
+            h.finish()
+        };
+        window.request_measured_layout_keyed(Default::default(), content_key, {
             let element_state = self.clone();
 
             move |known_dimensions, available_space, window, cx| {

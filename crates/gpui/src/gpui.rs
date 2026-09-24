@@ -156,7 +156,7 @@ pub use subscription::*;
 pub use svg_renderer::*;
 pub(crate) use tab_stop::*;
 use taffy::TaffyLayoutEngine;
-pub use taffy::{AvailableSpace, LayoutId};
+pub use taffy::{AvailableSpace, LayoutId, enable_layout_stats, take_layout_calls, take_reuse_stats, take_taffy_cache_stats, take_layout_stats};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
 pub use text_system::*;

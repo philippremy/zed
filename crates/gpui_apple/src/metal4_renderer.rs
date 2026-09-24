@@ -1,10 +1,13 @@
-//! A Metal 4 renderer, built up one primitive at a time. Covers solid-color
-//! quads, underlines, shadows, monochrome sprites, polychrome sprites (the
-//! first two primitives that sample a texture — see
-//! `draw_monochrome_sprites`), and paths (the one genuinely different shape
-//! of problem among all of these — a two-pass rasterize-then-composite
-//! pipeline, see `draw_paths_to_intermediate`) so far — see `draw()`'s doc
-//! comment for the exact, current scope.
+//! A Metal 4 renderer, built up one primitive at a time — now covering all
+//! six `gpui::Scene` primitive kinds: solid-color quads, underlines,
+//! shadows, monochrome sprites, polychrome sprites (the first two that
+//! sample a texture — see `draw_monochrome_sprites`), paths (the one
+//! genuinely different shape of problem among all of these — a two-pass
+//! rasterize-then-composite pipeline, see `draw_paths_to_intermediate`),
+//! and surfaces (video frames — `CVPixelBuffer`/`CVMetalTextureCache`
+//! interop, see `draw_surfaces`). See `draw()`'s doc comment for the exact
+//! current scope and its remaining, deliberate simplifications (fixed
+//! draw order rather than real scene z-order, chief among them).
 //!
 //! Ported from `metal_renderer.rs`'s device/layer setup (unchanged — Metal 4
 //! doesn't touch `CAMetalLayer`/drawable acquisition at all) but the
@@ -41,11 +44,16 @@
 //! `signalDrawable:` after commit, then `[drawable present]`).
 
 use crate::metal_atlas::MetalAtlas;
-use crate::metal_renderer::{PathRasterizationVertex, PathSprite};
+use crate::metal_renderer::{PathRasterizationVertex, PathSprite, SurfaceBounds};
+use core_foundation::base::TCFType;
+use core_video::{
+    metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
+    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+};
 use foreign_types::{ForeignType, ForeignTypeRef};
 use gpui::{
-    DevicePixels, MonochromeSprite, Path, PolychromeSprite, Quad, ScaledPixels, Scene, Shadow,
-    Size, Underline,
+    DevicePixels, MonochromeSprite, PaintSurface, Path, PolychromeSprite, Quad, ScaledPixels,
+    Scene, Shadow, Size, Underline,
 };
 use objc::{msg_send, sel, sel_impl};
 use objc2::rc::Retained;
@@ -137,6 +145,12 @@ pub struct Metal4Renderer {
     polychrome_sprite_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     path_rasterization_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     path_sprite_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    surface_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    /// Vends a `CVMetalTexture` (Y and CbCr planes, separately) from each
+    /// `PaintSurface`'s `CVPixelBuffer` every `draw_surfaces` call — a real
+    /// GPU-texture cache, not something this renderer manages itself; kept
+    /// alive for the renderer's whole lifetime like `MetalRenderer`'s own.
+    core_video_texture_cache: CVMetalTextureCache,
     unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
     viewport_size_buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Written by `draw_monochrome_sprites`/`draw_polychrome_sprites` right
@@ -176,6 +190,21 @@ pub struct Metal4Renderer {
     path_intermediate_msaa_texture: RefCell<Option<metal::Texture>>,
     /// The `(width, height)` the two textures above were last built for.
     path_intermediate_size: Cell<Option<(i32, i32)>>,
+    /// Single-slot, unlike every other instance buffer: `draw_surfaces`
+    /// draws one `PaintSurface` at a time in a loop (each has its own pair
+    /// of Y/CbCr textures fetched fresh from the video frame, so there's no
+    /// batching win to instancing them together the way quads/sprites are),
+    /// rewriting this buffer's one `SurfaceBounds` before each draw.
+    surfaces_buffer: RefCell<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    /// The Y/CbCr `CVMetalTexture`-backed textures added to `residency_set`
+    /// by the *previous* `draw_surfaces` call — unlike atlas/path
+    /// intermediate textures, these are brand new objects every single
+    /// call (a fresh video frame each time), so there's nothing to cache by
+    /// identity; this exists purely so `draw_surfaces` can remove last
+    /// call's entries before adding this call's, instead of letting the
+    /// residency set accumulate a new pair of stale texture references
+    /// forever.
+    surface_textures_in_residency: RefCell<Vec<Retained<ProtocolObject<dyn MTLTexture>>>>,
     /// The most recent atlas texture added to `residency_set` by
     /// `draw_monochrome_sprites`/`draw_polychrome_sprites` — re-added only
     /// when a draw call needs a *different* texture than last time, since
@@ -405,6 +434,15 @@ impl Metal4Renderer {
             residency_set.requestResidency();
         }
 
+        let surfaces_buffer = Self::new_buffer(&mtl4_device, mem::size_of::<SurfaceBounds>());
+        unsafe {
+            residency_set.addAllocation(surfaces_buffer.as_ref());
+            residency_set.commit();
+            residency_set.requestResidency();
+        }
+        let core_video_texture_cache = CVMetalTextureCache::new(None, device.clone(), None)
+            .expect("metal4: could not create a CVMetalTextureCache");
+
         let atlas_size_buffer = Self::new_buffer(&mtl4_device, mem::size_of::<ViewportSize>());
         unsafe {
             residency_set.addAllocation(atlas_size_buffer.as_ref());
@@ -444,6 +482,8 @@ impl Metal4Renderer {
         let path_rasterization_pipeline_state =
             Self::compile_path_rasterization_pipeline(&compiler, &library);
         let path_sprite_pipeline_state = Self::compile_path_sprite_pipeline(&compiler, &library);
+        let surface_pipeline_state =
+            Self::compile_pipeline(&compiler, &library, "surface_vertex", "surface_fragment");
 
         Self {
             device,
@@ -463,6 +503,8 @@ impl Metal4Renderer {
             polychrome_sprite_pipeline_state,
             path_rasterization_pipeline_state,
             path_sprite_pipeline_state,
+            surface_pipeline_state,
+            core_video_texture_cache,
             unit_vertices,
             viewport_size_buffer,
             atlas_size_buffer,
@@ -482,6 +524,8 @@ impl Metal4Renderer {
             path_intermediate_texture: RefCell::new(None),
             path_intermediate_msaa_texture: RefCell::new(None),
             path_intermediate_size: Cell::new(None),
+            surfaces_buffer: RefCell::new(surfaces_buffer),
+            surface_textures_in_residency: RefCell::new(Vec::new()),
             resident_atlas_texture: Cell::new(None),
             shared_event,
             frame_number: Cell::new(0),
@@ -739,13 +783,18 @@ impl Metal4Renderer {
         // nothing to do
     }
 
-    /// Renders `scene.shadows`, `scene.paths`, `scene.quads`,
-    /// `scene.underlines`, `scene.monochrome_sprites`, and
-    /// `scene.polychrome_sprites` only — every other primitive kind (just
-    /// `scene.surfaces` now) is silently skipped. This is the documented
-    /// scope of the Metal 4
-    /// milestone so far, not a bug: see the
-    /// module doc comment.
+    /// Renders every `gpui::Scene` primitive kind: `scene.shadows`,
+    /// `scene.paths`, `scene.quads`, `scene.underlines`,
+    /// `scene.monochrome_sprites`, `scene.polychrome_sprites`, and
+    /// `scene.surfaces`. Two deliberate simplifications remain, documented
+    /// where they're implemented rather than repeated per call site: draw
+    /// order between primitive *types* is fixed (shadows, then paths, then
+    /// quads, underlines, sprites, surfaces) rather than following the
+    /// scene's real z-order, and a few of the individual `draw_*` methods
+    /// have their own narrower simplifications (e.g. `draw_monochrome_sprites`
+    /// assumes one atlas texture per draw call, `draw_paths_from_intermediate`
+    /// always emits one composite sprite per path). See the module doc
+    /// comment and each method's own doc comment for the specifics.
     pub fn draw(&mut self, scene: &Scene) {
         let layer = match &self.layer {
             Some(l) => l.clone(),
@@ -754,13 +803,6 @@ impl Metal4Renderer {
                 return;
             }
         };
-
-        if !scene.surfaces.is_empty() {
-            log::warn!(
-                "metal4: scene has {} surface primitives that this milestone renderer does not draw",
-                scene.surfaces.len(),
-            );
-        }
 
         let viewport_size = layer.drawable_size();
         let viewport_size_px: Size<DevicePixels> = gpui::size(
@@ -856,6 +898,9 @@ impl Metal4Renderer {
         if !scene.polychrome_sprites.is_empty() {
             self.draw_polychrome_sprites(&scene.polychrome_sprites, viewport_size_px, &encoder);
         }
+        if !scene.surfaces.is_empty() {
+            self.draw_surfaces(&scene.surfaces, viewport_size_px, &encoder);
+        }
 
         unsafe { encoder.endEncoding() };
         unsafe { self.command_buffer.endCommandBuffer() };
@@ -904,12 +949,6 @@ impl Metal4Renderer {
 
         if size.width.0 <= 0 || size.height.0 <= 0 {
             bail!("metal4: invalid size for render_scene_to_image: {:?}", size);
-        }
-
-        if !scene.surfaces.is_empty() {
-            log::warn!(
-                "metal4: scene has primitives that this milestone renderer does not draw"
-            );
         }
 
         let texture_descriptor = metal::TextureDescriptor::new();
@@ -1004,6 +1043,9 @@ impl Metal4Renderer {
         }
         if !scene.polychrome_sprites.is_empty() {
             self.draw_polychrome_sprites(&scene.polychrome_sprites, size, &encoder);
+        }
+        if !scene.surfaces.is_empty() {
+            self.draw_surfaces(&scene.surfaces, size, &encoder);
         }
 
         unsafe { encoder.endEncoding() };
@@ -1763,6 +1805,167 @@ impl Metal4Renderer {
             );
         }
     }
+
+    /// One `PaintSurface` (a video frame) at a time, unlike every other
+    /// primitive — each has its own pair of Y/CbCr textures pulled fresh
+    /// from `core_video_texture_cache` every call, so there's no batching
+    /// win to instancing them together the way quads/sprites are (mirrors
+    /// `MetalRenderer::draw_surfaces`' own per-surface loop).
+    ///
+    /// Two real Metal-4-specific concerns beyond the mechanical
+    /// translation: the Y/CbCr textures are argument-table-bound
+    /// (`setTexture_atIndex`) like atlas/path-intermediate textures, so
+    /// they need residency too — and because they're brand new objects
+    /// every call (a fresh video frame each time, never "the same texture
+    /// as last call" the way `draw_monochrome_sprites`/
+    /// `draw_polychrome_sprites` can assume for their atlas textures), this
+    /// removes last call's two textures from `residency_set` before adding
+    /// this call's, rather than letting stale entries accumulate forever.
+    fn draw_surfaces(
+        &self,
+        surfaces: &[PaintSurface],
+        viewport_size: Size<DevicePixels>,
+        encoder: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
+    ) {
+        if surfaces.is_empty() {
+            return;
+        }
+
+        unsafe {
+            for texture in self.surface_textures_in_residency.borrow_mut().drain(..) {
+                self.residency_set.removeAllocation(texture.as_ref());
+            }
+        }
+
+        unsafe {
+            self.viewport_size_buffer
+                .contents()
+                .cast::<ViewportSize>()
+                .as_ptr()
+                .write(ViewportSize {
+                    width: i32::from(viewport_size.width),
+                    height: i32::from(viewport_size.height),
+                });
+        }
+
+        let mut newly_resident = Vec::with_capacity(surfaces.len() * 2);
+
+        for surface in surfaces {
+            if surface.image_buffer.get_pixel_format()
+                != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            {
+                log::error!(
+                    "metal4: surface pixel buffer is not 420YpCbCr8BiPlanarFullRange, skipping"
+                );
+                continue;
+            }
+
+            let texture_size = gpui::size(
+                DevicePixels::from(surface.image_buffer.get_width() as i32),
+                DevicePixels::from(surface.image_buffer.get_height() as i32),
+            );
+
+            let Ok(y_texture_cv) = self.core_video_texture_cache.create_texture_from_image(
+                surface.image_buffer.as_concrete_TypeRef(),
+                None,
+                metal::MTLPixelFormat::R8Unorm,
+                surface.image_buffer.get_width_of_plane(0),
+                surface.image_buffer.get_height_of_plane(0),
+                0,
+            ) else {
+                log::error!("metal4: failed to create a Metal texture for the surface's Y plane");
+                continue;
+            };
+            let Ok(cb_cr_texture_cv) = self.core_video_texture_cache.create_texture_from_image(
+                surface.image_buffer.as_concrete_TypeRef(),
+                None,
+                metal::MTLPixelFormat::RG8Unorm,
+                surface.image_buffer.get_width_of_plane(1),
+                surface.image_buffer.get_height_of_plane(1),
+                1,
+            ) else {
+                log::error!(
+                    "metal4: failed to create a Metal texture for the surface's CbCr plane"
+                );
+                continue;
+            };
+
+            // CVMetalTextureGetTexture is a "get" accessor, not a create/
+            // copy — the returned object is owned by y_texture_cv/
+            // cb_cr_texture_cv (kept alive for this loop iteration), so
+            // bridge_retain's real retain (not the autoreleased-return-value
+            // fast path bridge_retain_autoreleased assumes, which this
+            // plain C FFI call doesn't participate in) is the correct,
+            // if slightly conservative, way to hold our own reference.
+            let y_texture: Retained<ProtocolObject<dyn MTLTexture>> = unsafe {
+                bridge_retain(
+                    CVMetalTextureGetTexture(y_texture_cv.as_concrete_TypeRef()) as *mut c_void,
+                )
+            };
+            let cb_cr_texture: Retained<ProtocolObject<dyn MTLTexture>> = unsafe {
+                bridge_retain(
+                    CVMetalTextureGetTexture(cb_cr_texture_cv.as_concrete_TypeRef())
+                        as *mut c_void,
+                )
+            };
+
+            unsafe {
+                self.residency_set.addAllocation(y_texture.as_ref());
+                self.residency_set.addAllocation(cb_cr_texture.as_ref());
+                self.residency_set.commit();
+                self.residency_set.requestResidency();
+            }
+            newly_resident.push(y_texture.clone());
+            newly_resident.push(cb_cr_texture.clone());
+
+            let bounds = SurfaceBounds {
+                bounds: surface.bounds,
+                content_mask: surface.content_mask,
+            };
+
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &bounds as *const SurfaceBounds,
+                    self.surfaces_buffer.borrow().contents().as_ptr() as *mut SurfaceBounds,
+                    1,
+                );
+                self.atlas_size_buffer
+                    .contents()
+                    .cast::<ViewportSize>()
+                    .as_ptr()
+                    .write(ViewportSize {
+                        width: i32::from(texture_size.width),
+                        height: i32::from(texture_size.height),
+                    });
+
+                self.argument_table
+                    .setAddress_atIndex(self.unit_vertices.gpuAddress(), 0);
+                self.argument_table
+                    .setAddress_atIndex(self.surfaces_buffer.borrow().gpuAddress(), 1);
+                self.argument_table
+                    .setAddress_atIndex(self.viewport_size_buffer.gpuAddress(), 2);
+                self.argument_table
+                    .setAddress_atIndex(self.atlas_size_buffer.gpuAddress(), 3);
+                self.argument_table
+                    .setTexture_atIndex(y_texture.gpuResourceID(), 4);
+                self.argument_table
+                    .setTexture_atIndex(cb_cr_texture.gpuResourceID(), 5);
+                encoder.setArgumentTable_atStages(
+                    &self.argument_table,
+                    MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+                );
+                encoder.setRenderPipelineState(&self.surface_pipeline_state);
+                encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                    MTLPrimitiveType::Triangle,
+                    0,
+                    6,
+                    1,
+                );
+            }
+        }
+
+        *self.surface_textures_in_residency.borrow_mut() = newly_resident;
+    }
 }
 
 /// Duplicated from `metal_renderer.rs`'s private helper of the same name
@@ -2227,6 +2430,108 @@ mod tests {
         assert_pixel_matches(&image, 10, 10, black, "outside the triangle, top-left corner");
         assert_pixel_matches(&image, 190, 190, black, "outside the triangle, bottom-right corner");
         assert_pixel_matches(&image, 100, 190, black, "below the triangle's apex");
+    }
+
+    /// Renders a single video-frame surface through the real Metal 4 path —
+    /// the last of the six primitives, and the only one backed by a real
+    /// `CVPixelBuffer` (biplanar 4:2:0 YCbCr, full range) rather than
+    /// anything gpui's `Scene` types construct directly. Fills the whole
+    /// buffer with `Y=0xFF` (full luma) and neutral chroma
+    /// (`Cb=Cr=0x80`) — an achromatic value that reduces to plain grayscale
+    /// under *any* correctly-designed YCbCr matrix, avoiding the need to
+    /// hand-derive `surface_fragment`'s conversion matrix precisely just to
+    /// pick a test colour — so the rendered surface should come out white
+    /// (or very close: `Cb=Cr=128/255=0.50196`, not exactly the
+    /// mathematically neutral `0.5`, a negligible few-thousandths error).
+    #[test]
+    fn surfaces_render_at_expected_positions_and_colors() {
+        let canvas = size(200i32, 200i32);
+        let canvas_scaled = size(
+            ScaledPixels(canvas.width as f32),
+            ScaledPixels(canvas.height as f32),
+        );
+        let full_mask = gpui::ContentMask {
+            bounds: Bounds::new(Point::default(), canvas_scaled),
+        };
+
+        let frame_width = 64usize;
+        let frame_height = 64usize;
+        // Without kCVPixelBufferMetalCompatibilityKey, the buffer's backing
+        // IOSurface isn't Metal-shareable and CVMetalTextureCache's
+        // create_texture_from_image fails outright (CVReturn -6660) — a
+        // real bug this test caught on its first run, not a hypothetical.
+        let options = core_foundation::dictionary::CFDictionary::from_CFType_pairs(&[(
+            core_foundation::string::CFString::from(
+                core_video::pixel_buffer::CVPixelBufferKeys::MetalCompatibility,
+            ),
+            core_foundation::boolean::CFBoolean::true_value().as_CFType(),
+        )]);
+        let pixel_buffer = core_video::pixel_buffer::CVPixelBuffer::new(
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            frame_width,
+            frame_height,
+            Some(&options),
+        )
+        .expect("failed to create test CVPixelBuffer");
+
+        pixel_buffer.lock_base_address(0);
+        unsafe {
+            let y_base = pixel_buffer.get_base_address_of_plane(0) as *mut u8;
+            let y_bytes_per_row = pixel_buffer.get_bytes_per_row_of_plane(0);
+            let y_width = pixel_buffer.get_width_of_plane(0);
+            let y_height = pixel_buffer.get_height_of_plane(0);
+            for row in 0..y_height {
+                std::ptr::write_bytes(y_base.add(row * y_bytes_per_row), 0xFF, y_width);
+            }
+
+            let cb_cr_base = pixel_buffer.get_base_address_of_plane(1) as *mut u8;
+            let cb_cr_bytes_per_row = pixel_buffer.get_bytes_per_row_of_plane(1);
+            // Width of plane 1, in CbCr *pairs* — the plane itself is 2
+            // bytes (one Cb, one Cr) per pair, biplanar 4:2:0.
+            let cb_cr_pair_count = pixel_buffer.get_width_of_plane(1);
+            let cb_cr_height = pixel_buffer.get_height_of_plane(1);
+            for row in 0..cb_cr_height {
+                std::ptr::write_bytes(
+                    cb_cr_base.add(row * cb_cr_bytes_per_row),
+                    0x80,
+                    cb_cr_pair_count * 2,
+                );
+            }
+        }
+        pixel_buffer.unlock_base_address(0);
+
+        let surface = PaintSurface {
+            order: 0,
+            bounds: Bounds::new(
+                point(ScaledPixels(60.0), ScaledPixels(60.0)),
+                size(ScaledPixels(80.0), ScaledPixels(80.0)),
+            ),
+            content_mask: full_mask,
+            image_buffer: pixel_buffer,
+        };
+
+        let mut scene = Scene::default();
+        scene.surfaces.push(surface);
+
+        let mut renderer = Metal4Renderer::new_headless();
+        let image = renderer
+            .render_scene_to_image(&scene, size(canvas.width.into(), canvas.height.into()))
+            .expect("metal4 headless render failed");
+
+        let out_path = std::env::temp_dir().join("metal4_surface_test.png");
+        image
+            .save(&out_path)
+            .expect("failed to save metal4 surface test PNG");
+        eprintln!("metal4 surface test image written to {}", out_path.display());
+
+        let white = hsla(0.0, 0.0, 1.0, 1.0);
+        assert_pixel_matches(&image, 100, 100, white, "surface center");
+        assert_pixel_matches(&image, 65, 65, white, "surface, near top-left corner");
+        assert_pixel_matches(&image, 134, 134, white, "surface, near bottom-right corner");
+
+        let black = hsla(0.0, 0.0, 0.0, 1.0);
+        assert_pixel_matches(&image, 10, 10, black, "outside the surface, top-left");
+        assert_pixel_matches(&image, 190, 190, black, "outside the surface, bottom-right");
     }
 }
 

@@ -24,7 +24,7 @@ use crate::{
     MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent,
     MouseUpEvent, OngoingScroll, Overflow, ParentElement, PinchEvent, Pixels, Point, Render,
     ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task, TooltipId,
-    TouchDragEvent, TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
+    TouchClickEvent, TouchDragEvent, TouchPhase, Visibility, Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -2975,6 +2975,34 @@ impl Interactivity {
                     .clicked_state
                     .get_or_insert_with(Default::default)
                     .clone();
+
+                // A long press is touch's secondary click. Claiming it keeps the finger from also
+                // ending as a tap.
+                if !aux_click_listeners.is_empty() {
+                    let listeners = aux_click_listeners.clone();
+                    let hitbox = hitbox.clone();
+                    window.on_mouse_event(
+                        move |event: &LongPressEvent, phase, window: &mut Window, cx| {
+                            if phase != DispatchPhase::Bubble
+                                || event.phase != TouchPhase::Started
+                                || window.default_prevented()
+                                || !hitbox.is_hovered(window)
+                            {
+                                return;
+                            }
+                            let click = ClickEvent::Touch(TouchClickEvent {
+                                position: event.start_position,
+                                tap_count: 1,
+                                long_press: true,
+                            });
+                            for listener in &listeners {
+                                listener(&click, window, cx);
+                            }
+                            window.prevent_default();
+                            cx.stop_propagation();
+                        },
+                    );
+                }
 
                 window.on_mouse_event({
                     let pending_mouse_down = pending_mouse_down.clone();

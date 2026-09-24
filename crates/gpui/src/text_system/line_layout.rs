@@ -492,6 +492,25 @@ pub(crate) struct LineLayoutIndex {
     wrapped_lines_by_hash_index: usize,
 }
 
+/// `x` moved by the distance from `from` to `to`. An index below `from` (a state that was never
+/// recorded) stays at the start of the destination.
+fn moved(x: usize, from: usize, to: usize) -> usize {
+    x.saturating_sub(from) + to
+}
+
+impl LineLayoutIndex {
+    /// `self`, moved by the distance from `from` to `to` (all three in the same kind of index).
+    pub(crate) fn shifted(&self, from: &Self, to: &Self) -> Self {
+        Self {
+            font_generation: self.font_generation,
+            lines_index: moved(self.lines_index, from.lines_index, to.lines_index),
+            wrapped_lines_index: moved(self.wrapped_lines_index, from.wrapped_lines_index, to.wrapped_lines_index),
+            lines_by_hash_index: moved(self.lines_by_hash_index, from.lines_by_hash_index, to.lines_by_hash_index),
+            wrapped_lines_by_hash_index: moved(self.wrapped_lines_by_hash_index, from.wrapped_lines_by_hash_index, to.wrapped_lines_by_hash_index),
+        }
+    }
+}
+
 impl LineLayoutCache {
     pub fn new(
         platform_text_system: Arc<dyn PlatformTextSystem>,

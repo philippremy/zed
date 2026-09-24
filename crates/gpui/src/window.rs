@@ -1013,6 +1013,44 @@ pub(crate) struct Frame {
     pub(crate) tab_stops: TabStopMap,
 }
 
+/// `x` moved by the distance from `from` to `to`. An index below `from` (a state that was never
+/// recorded) stays at the start of the destination.
+fn moved(x: usize, from: usize, to: usize) -> usize {
+    x.saturating_sub(from) + to
+}
+
+impl PrepaintStateIndex {
+    /// `self`, moved by the distance from `from` to `to`.
+    pub(crate) fn shifted(&self, from: &Self, to: &Self) -> Self {
+        Self {
+            hitboxes_index: moved(self.hitboxes_index, from.hitboxes_index, to.hitboxes_index),
+            tooltips_index: moved(self.tooltips_index, from.tooltips_index, to.tooltips_index),
+            deferred_draws_index: moved(self.deferred_draws_index, from.deferred_draws_index, to.deferred_draws_index),
+            dispatch_tree_index: moved(self.dispatch_tree_index, from.dispatch_tree_index, to.dispatch_tree_index),
+            accessed_element_states_index: moved(self.accessed_element_states_index, from.accessed_element_states_index, to.accessed_element_states_index),
+            effects_index: moved(self.effects_index, from.effects_index, to.effects_index),
+            line_layout_index: self.line_layout_index.shifted(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
+}
+
+impl PaintIndex {
+    /// `self`, moved by the distance from `from` to `to`.
+    pub(crate) fn shifted(&self, from: &Self, to: &Self) -> Self {
+        Self {
+            scene_index: moved(self.scene_index, from.scene_index, to.scene_index),
+            #[cfg(any(test, feature = "test-support"))]
+            debug_bounds_index: moved(self.debug_bounds_index, from.debug_bounds_index, to.debug_bounds_index),
+            mouse_listeners_index: moved(self.mouse_listeners_index, from.mouse_listeners_index, to.mouse_listeners_index),
+            input_handlers_index: moved(self.input_handlers_index, from.input_handlers_index, to.input_handlers_index),
+            cursor_styles_index: moved(self.cursor_styles_index, from.cursor_styles_index, to.cursor_styles_index),
+            accessed_element_states_index: moved(self.accessed_element_states_index, from.accessed_element_states_index, to.accessed_element_states_index),
+            tab_handle_index: moved(self.tab_handle_index, from.tab_handle_index, to.tab_handle_index),
+            line_layout_index: self.line_layout_index.shifted(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct PrepaintStateIndex {
     hitboxes_index: usize,
@@ -3993,6 +4031,28 @@ impl Window {
         )
     }
 
+    /// A cached view that is replayed wholesale is copied to a new position in each per-frame
+    /// array, so the recorded ranges of the cached views *nested inside it* (which it replays
+    /// without visiting them) would point at where they used to be. Move them by the same
+    /// distance, so that a later frame which re-renders the outer view and reuses an inner one
+    /// slices the right part of the frame.
+    fn shift_nested_view_states(
+        &mut self,
+        accessed: Range<&usize>,
+        prepaint: Option<(&PrepaintStateIndex, &PrepaintStateIndex)>,
+        paint: Option<(&PaintIndex, &PaintIndex)>,
+    ) {
+        let view_state = crate::view::view_state_type_id();
+        for key in &self.rendered_frame.accessed_element_states[*accessed.start..*accessed.end] {
+            if key.1 != view_state {
+                continue;
+            }
+            if let Some(state) = self.rendered_frame.element_states.get_mut(key) {
+                crate::view::shift_view_state(state.inner.as_mut(), prepaint, paint);
+            }
+        }
+    }
+
     pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
         PrepaintStateIndex {
             hitboxes_index: self.next_frame.hitboxes.len(),
@@ -4024,6 +4084,12 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>, cx: &mut App) {
+        let destination = self.prepaint_index();
+        self.shift_nested_view_states(
+            &range.start.accessed_element_states_index..&range.end.accessed_element_states_index,
+            Some((&range.start, &destination)),
+            None,
+        );
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
@@ -4099,6 +4165,12 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        let destination = self.paint_index();
+        self.shift_nested_view_states(
+            &range.start.accessed_element_states_index..&range.end.accessed_element_states_index,
+            None,
+            Some((&range.start, &destination)),
+        );
         // Cached elements still exist in the frame even when their paint methods don't run.
         #[cfg(any(test, feature = "test-support"))]
         for (selector, bounds) in &self.rendered_frame.debug_bounds_records

@@ -5,7 +5,7 @@ use std::{cell::Cell, rc::Rc};
 
 use gpui::{
     AppContext as _, Context, Entity, Global, IntoElement, Modifiers, MouseMoveEvent,
-    PlatformInput, Render, StyleRefinement, Styled, TestAppContext, WindowHandle, canvas, div,
+    ParentElement, PlatformInput, Render, StyleRefinement, Styled, TestAppContext, WindowHandle, canvas, div,
     point, px,
 };
 
@@ -183,6 +183,153 @@ fn cached_view_repaints_when_an_entity_read_only_while_painting_changes(cx: &mut
     let paints_now = paints.get();
     draw(window, cx);
     assert_eq!(paints.get(), paints_now, "and is reused again afterwards");
+}
+
+// --- nesting -------------------------------------------------------------------------------
+
+struct Outer {
+    inner: Entity<Inner>,
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for Outer {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div().child(
+            self.inner
+                .clone()
+                .cached(StyleRefinement::default().size(px(50.))),
+        )
+    }
+}
+
+struct Inner {
+    renders: Rc<Cell<usize>>,
+}
+
+impl Render for Inner {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div()
+    }
+}
+
+/// A cached view that re-renders must not force the cached views nested inside it to re-render
+/// too: each decides for itself.
+#[gpui::test]
+fn nested_cached_view_is_reused_when_its_parent_rerenders(cx: &mut TestAppContext) {
+    let (outer_renders, inner_renders) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    let window = cx.add_window({
+        let (outer_renders, inner_renders) = (outer_renders.clone(), inner_renders.clone());
+        move |_, cx| Root {
+            child: cx.new(|cx| Outer {
+                inner: cx.new(|_| Inner { renders: inner_renders }),
+                renders: outer_renders,
+            }),
+        }
+    });
+    assert_eq!((outer_renders.get(), inner_renders.get()), (1, 1));
+
+    let outer = window.read_with(cx, |root, _| root.child.clone()).expect("read root");
+    outer.update(cx, |_, cx| cx.notify());
+    draw(window, cx);
+    assert!(outer_renders.get() > 1, "the notified outer view re-renders");
+    assert_eq!(inner_renders.get(), 1, "the inner view, untouched, is reused");
+}
+
+/// The ranges a cached view records for the cached views nested inside it must follow it when it
+/// is replayed at a different position in the frame; otherwise a later frame that re-renders the
+/// outer view and reuses the inner one replays the wrong part of the previous frame.
+struct Prefixed {
+    prefix_count: Rc<Cell<usize>>,
+    prefix_runs: Rc<Cell<usize>>,
+    outer: Entity<EffectOuter>,
+}
+
+impl Render for Prefixed {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+        let runs = self.prefix_runs.clone();
+        div()
+            .children((0..self.prefix_count.get()).map(move |_| {
+                let runs = runs.clone();
+                canvas(
+                    move |_, window, cx| {
+                        let runs = runs.clone();
+                        window.replayable_effect(cx, move |_, _| runs.set(runs.get() + 1));
+                    },
+                    |_, _, _, _| {},
+                )
+                // Out of flow, so the cached view after them keeps its bounds.
+                .absolute()
+                .size(px(0.))
+            }))
+            .child(self.outer.clone().cached(StyleRefinement::default().size(px(60.))))
+    }
+}
+
+struct EffectOuter {
+    inner: Entity<EffectInner>,
+}
+
+impl Render for EffectOuter {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().child(self.inner.clone().cached(StyleRefinement::default().size(px(30.))))
+    }
+}
+
+struct EffectInner {
+    runs: Rc<Cell<usize>>,
+}
+
+impl Render for EffectInner {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+        let runs = self.runs.clone();
+        canvas(
+            move |_, window, cx| {
+                let runs = runs.clone();
+                window.replayable_effect(cx, move |_, _| runs.set(runs.get() + 1));
+            },
+            |_, _, _, _| {},
+        )
+        .size_full()
+    }
+}
+
+#[gpui::test]
+fn nested_cached_view_follows_its_parent_when_the_parent_moves(cx: &mut TestAppContext) {
+    let prefix_count = Rc::new(Cell::new(0));
+    let (prefix_runs, inner_runs) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    let window = cx.add_window({
+        let (prefix_count, prefix_runs, inner_runs) =
+            (prefix_count.clone(), prefix_runs.clone(), inner_runs.clone());
+        move |_, cx| Prefixed {
+            prefix_count,
+            prefix_runs,
+            outer: cx.new(|cx| EffectOuter {
+                inner: cx.new(|_| EffectInner { runs: inner_runs }),
+            }),
+        }
+    });
+    let draw = |cx: &mut TestAppContext| {
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx)).unwrap();
+    };
+    assert_eq!(inner_runs.get(), 1);
+
+    // Frame 2: three effects now precede the outer view, which is reused at a later position.
+    prefix_count.set(3);
+    let root = window.read_with(cx, |root, _| root.outer.clone()).expect("read root");
+    draw(cx);
+
+    // Frame 3: the outer view re-renders and reuses the inner one from frame 2's layout.
+    root.update(cx, |_, cx| cx.notify());
+    let (prefix_before, inner_before) = (prefix_runs.get(), inner_runs.get());
+    draw(cx);
+    assert_eq!(inner_runs.get() - inner_before, 1, "the inner view's effect still runs once");
+    assert_eq!(
+        prefix_runs.get() - prefix_before,
+        3,
+        "and the prefix effects run once each, not in the inner view's place"
+    );
 }
 
 // --- globals -------------------------------------------------------------------------------

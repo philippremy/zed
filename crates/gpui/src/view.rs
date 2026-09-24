@@ -450,6 +450,31 @@ fn report_mismatch(entity_id: EntityId, source: Option<&'static core::panic::Loc
     }
 }
 
+pub(crate) fn view_state_type_id() -> TypeId {
+    TypeId::of::<ViewElementState>()
+}
+
+/// Moves the recorded ranges of a cached view's state; see `Window::shift_nested_view_states`.
+pub(crate) fn shift_view_state(
+    state: &mut dyn std::any::Any,
+    prepaint: Option<(&PrepaintStateIndex, &PrepaintStateIndex)>,
+    paint: Option<(&PaintIndex, &PaintIndex)>,
+) {
+    // Element state is stored as `Option<S>` (see `Window::with_element_state`).
+    let Some(Some(state)) = state.downcast_mut::<Option<ViewElementState>>() else {
+        debug_assert!(false, "a view element state that is not an Option<ViewElementState>");
+        return;
+    };
+    if let Some((from, to)) = prepaint {
+        let range = &state.prepaint_range;
+        state.prepaint_range = range.start.shifted(from, to)..range.end.shifted(from, to);
+    }
+    if let Some((from, to)) = paint {
+        let range = &state.paint_range;
+        state.paint_range = range.start.shifted(from, to)..range.end.shifted(from, to);
+    }
+}
+
 fn record_outcome(outcome: CacheOutcome) {
     CACHE_STATS[outcome as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -702,7 +727,6 @@ fn prepaint_view(
                     return (None, element_state);
                 }
 
-                let refreshing = mem::replace(&mut window.refreshing, true);
                 let prepaint_start = window.prepaint_index();
                 let outer_input_reads = window.input_reads.replace(0);
                 let (element, accessed_entities, accessed_globals) = cx.detect_accessed(|cx| {
@@ -718,7 +742,6 @@ fn prepaint_view(
                 });
 
                 let prepaint_end = window.prepaint_index();
-                window.refreshing = refreshing;
 
                 let mut verify_pending = None;
                 if let Some((old_prepaint, old_paint)) = verify_old {
@@ -795,7 +818,6 @@ fn paint_view(
                     let paint_start = window.paint_index();
 
                     if let Some(element) = element {
-                        let refreshing = mem::replace(&mut window.refreshing, true);
                         let outer_input_reads = window.input_reads.replace(0);
                         let ((), painted_entities, painted_globals) =
                             cx.detect_accessed(|cx| element.paint(window, cx));
@@ -804,7 +826,6 @@ fn paint_view(
                         let inputs = window.input_reads.get();
                         window.input_reads.set(outer_input_reads | inputs);
                         element_state.deps.capture_inputs(window, inputs);
-                        window.refreshing = refreshing;
                     } else {
                         window.reuse_paint(element_state.paint_range.clone());
                     }

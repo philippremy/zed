@@ -248,8 +248,8 @@ fn ui_key_input(key: &str) -> Option<String> {
 /// Replace the system's main menu with the stored model. Called from `-buildMenuWithBuilder:`.
 ///
 /// Our first menu is the application menu. Every other menu goes to the system menu with the same
-/// (localised) title, which keeps the familiar order and titles. File and Edit have their children
-/// replaced. Window and Help are system-managed and come back if replaced or removed, so ours are
+/// (localised) title, which keeps the familiar order and titles. Edit has its children replaced;
+/// File is removed and ours inserted in its place. Window and Help are system-managed and come back if replaced or removed, so ours are
 /// merged in at their start. System menus we do not provide are removed; our menus with no
 /// counterpart follow the application menu.
 pub(super) fn build(builder: &ProtocolObject<dyn UIMenuBuilder>, mtm: MainThreadMarker) {
@@ -258,7 +258,8 @@ pub(super) fn build(builder: &ProtocolObject<dyn UIMenuBuilder>, mtm: MainThread
             return;
         }
         // SAFETY: framework string constants.
-        let (application, window_menu, help_menu) = unsafe { (UIMenuApplication, UIMenuWindow, UIMenuHelp) };
+        let (application, window_menu, help_menu, file_menu) =
+            unsafe { (UIMenuApplication, UIMenuWindow, UIMenuHelp, UIMenuFile) };
         let system: Vec<(&'static objc2_ui_kit::UIMenuIdentifier, String)> = replaced_system_menus()
             .into_iter()
             .filter_map(|identifier| {
@@ -277,8 +278,12 @@ pub(super) fn build(builder: &ProtocolObject<dyn UIMenuBuilder>, mtm: MainThread
                 replace_children(builder, application, elements(items, mtm));
                 continue;
             }
-            let counterpart = system.iter().enumerate().find(|(index, (_, system_title))| {
-                !claimed[*index] && system_title.trim().eq_ignore_ascii_case(title.trim())
+            // File is never adopted: replacing its children leaves it empty on iPadOS, whereas
+            // removing it and inserting our own menu in its place works.
+            let counterpart = system.iter().enumerate().find(|(index, (identifier, system_title))| {
+                !claimed[*index]
+                    && **identifier != file_menu
+                    && system_title.trim().eq_ignore_ascii_case(title.trim())
             });
             let Some((index, (identifier, _))) = counterpart else {
                 let menu = UIMenu::menuWithTitle_image_identifier_options_children(

@@ -22,7 +22,7 @@ use objc2_ui_kit::{
     UIMenuEdit, UIMenuElement, UIMenuElementAttributes, UIMenuElementState, UIMenuFile,
     UIMenuFormat, UIMenuHelp, UIMenuOptions, UIMenuSystem, UIMenuView, UIMenuWindow,
 };
-use std::{cell::RefCell, ptr::NonNull};
+use std::{cell::RefCell, collections::HashSet, ptr::NonNull};
 
 /// Selector every non-OS command targets; implemented by the application delegate.
 pub(super) fn item_selector() -> Sel {
@@ -110,11 +110,16 @@ pub(super) fn owned_menus() -> Option<Vec<OwnedMenu>> {
 /// Store `menus` and ask UIKit to rebuild the main menu.
 pub(super) fn set_menus(menus: Vec<Menu>, keymap: &Keymap) {
     let mut actions = Vec::new();
+    let mut claimed_keys = HashSet::new();
     let nodes = menus
         .iter()
         .map(|menu| Node::Submenu {
             title: menu.name.to_string(),
-            items: menu.items.iter().filter_map(|item| convert(item, &mut actions, keymap)).collect(),
+            items: menu
+                .items
+                .iter()
+                .filter_map(|item| convert(item, &mut actions, &mut claimed_keys, keymap))
+                .collect(),
             disabled: menu.disabled,
         })
         .collect();
@@ -131,14 +136,23 @@ pub(super) fn set_menus(menus: Vec<Menu>, keymap: &Keymap) {
     }
 }
 
-fn convert(item: &MenuItem, actions: &mut Vec<ActionEntry>, keymap: &Keymap) -> Option<Node> {
+fn convert(
+    item: &MenuItem,
+    actions: &mut Vec<ActionEntry>,
+    claimed_keys: &mut HashSet<(String, isize)>,
+    keymap: &Keymap,
+) -> Option<Node> {
     Some(match item {
         MenuItem::Separator => Node::Separator,
         // Menus the OS populates (macOS "Services") have no iPadOS counterpart.
         MenuItem::SystemMenu(_) => return None,
         MenuItem::Submenu(menu) => Node::Submenu {
             title: menu.name.to_string(),
-            items: menu.items.iter().filter_map(|item| convert(item, actions, keymap)).collect(),
+            items: menu
+                .items
+                .iter()
+                .filter_map(|item| convert(item, actions, claimed_keys, keymap))
+                .collect(),
             disabled: menu.disabled,
         },
         MenuItem::Action {
@@ -164,7 +178,15 @@ fn convert(item: &MenuItem, actions: &mut Vec<ActionEntry>, keymap: &Keymap) -> 
             Node::Command {
                 title: name.to_string(),
                 index,
-                key: key_equivalent(action.as_ref(), keymap),
+                key: key_equivalent(action.as_ref(), keymap).filter(|key| {
+                    // UIKit rejects an entire menu when two of its shortcuts collide, so the first
+                    // command keeps a shortcut and later ones show without.
+                    let unique = claimed_keys.insert((key.input.clone(), key.modifiers.bits()));
+                    if !unique {
+                        log::debug!("menu shortcut {:?} for {name:?} is already taken, omitting it", key.input);
+                    }
+                    unique
+                }),
                 checked: *checked,
                 os_selector,
             }
@@ -267,6 +289,19 @@ pub(super) fn build(builder: &ProtocolObject<dyn UIMenuBuilder>, mtm: MainThread
                 Some((identifier, title))
             })
             .collect();
+        log::debug!(
+            "menu build: system menus {:?}, ours {:?}",
+            system.iter().map(|(_, title)| title.as_str()).collect::<Vec<_>>(),
+            state
+                .model
+                .menus
+                .iter()
+                .filter_map(|node| match node {
+                    Node::Submenu { title, .. } => Some(title.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
         let mut claimed = vec![false; system.len()];
         let mut unmatched = Vec::new();
 
@@ -275,6 +310,7 @@ pub(super) fn build(builder: &ProtocolObject<dyn UIMenuBuilder>, mtm: MainThread
                 continue;
             };
             if position == 0 {
+                log::debug!("menu build: replacing the children of the application menu ({} items)", items.len());
                 replace_children(builder, application, elements(items, mtm));
                 continue;
             }
@@ -286,6 +322,7 @@ pub(super) fn build(builder: &ProtocolObject<dyn UIMenuBuilder>, mtm: MainThread
                     && system_title.trim().eq_ignore_ascii_case(title.trim())
             });
             let Some((index, (identifier, _))) = counterpart else {
+                log::debug!("menu build: {title:?} has no system counterpart, inserting it as a new menu");
                 let menu = UIMenu::menuWithTitle_image_identifier_options_children(
                     &NSString::from_str(title),
                     None,
@@ -298,6 +335,7 @@ pub(super) fn build(builder: &ProtocolObject<dyn UIMenuBuilder>, mtm: MainThread
                 continue;
             };
             claimed[index] = true;
+            log::debug!("menu build: {title:?} -> system menu {:?}", system[index].1);
             if *identifier == window_menu || *identifier == help_menu {
                 let inline = UIMenu::menuWithTitle_image_identifier_options_children(
                     &NSString::new(),
@@ -316,12 +354,18 @@ pub(super) fn build(builder: &ProtocolObject<dyn UIMenuBuilder>, mtm: MainThread
         for (index, (identifier, _)) in system.iter().enumerate() {
             let special = *identifier == window_menu || *identifier == help_menu;
             if !claimed[index] && !special {
+                log::debug!("menu build: removing system menu {:?}", system[index].1);
                 builder.removeMenuForIdentifier(identifier);
             }
         }
         // Inserting each directly after the application menu, last first, keeps their order.
         for menu in unmatched.into_iter().rev() {
             builder.insertSiblingMenu_afterMenuForIdentifier(&menu, application);
+            log::debug!(
+                "menu build: inserted {:?} after the application menu; UIKit finds it: {}",
+                menu.title().to_string(),
+                builder.menuForIdentifier(&menu.identifier()).is_some()
+            );
         }
     });
 }

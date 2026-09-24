@@ -185,9 +185,7 @@ impl Platform for IosPlatform {
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {
-        // iOS typically has one active window
-        // This would need to track the current key window
-        None
+        super::application::active_window_handle()
     }
 
     fn open_window(

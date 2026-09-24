@@ -64,6 +64,19 @@ pub(super) fn unregister_window(window: &Rc<IosWindowState>) {
     APP_STATE.with_borrow_mut(|state| state.windows.retain(|entry| !entry.ptr_eq(&window)));
 }
 
+/// The window GPUI should treat as active: the active one, else the most recently opened (the
+/// scene can be momentarily inactive while system UI such as the menu bar is up).
+pub(super) fn active_window_handle() -> Option<gpui::AnyWindowHandle> {
+    let windows: Vec<_> = APP_STATE.with_borrow(|state| {
+        state.windows.iter().filter_map(Weak::upgrade).collect()
+    });
+    windows
+        .iter()
+        .find(|window| window.is_active())
+        .or(windows.last())
+        .map(|window| window.handle())
+}
+
 pub(super) fn with_windows(mut callback: impl FnMut(&IosWindowState)) {
     // Native callbacks may open or close windows. Do not hold a registry borrow
     // across them, and skip snapshot entries that have since been unregistered.

@@ -228,7 +228,8 @@ fn ui_key_input(key: &str) -> Option<String> {
             "pagedown" => "UIKeyInputPageDown",
             "home" => "UIKeyInputHome",
             "end" => "UIKeyInputEnd",
-            "delete" => "UIKeyInputDelete",
+            // UIKit defines no `UIKeyInput` constant for these two.
+            "delete" => "\u{7f}",
             "backspace" => "\u{8}",
             "enter" => "\r",
             "tab" => "\t",
@@ -245,6 +246,12 @@ fn ui_key_input(key: &str) -> Option<String> {
 // ---- building ------------------------------------------------------------------------------
 
 /// Replace the system's main menu with the stored model. Called from `-buildMenuWithBuilder:`.
+///
+/// Our first menu is the application menu: its items replace the children of the system one.
+/// Every other menu takes the place of the system menu with the same (localised) title, so the
+/// familiar order File / Edit / Window / Help is kept. Menus UIKit refuses to replace (Window and
+/// Help are special) get our items merged in at their start instead. System menus we do not
+/// provide are removed, and any of our menus with no system counterpart follow the application menu.
 pub(super) fn build(builder: &ProtocolObject<dyn UIMenuBuilder>, mtm: MainThreadMarker) {
     STATE.with_borrow(|state| {
         if state.model.menus.is_empty() {
@@ -252,9 +259,15 @@ pub(super) fn build(builder: &ProtocolObject<dyn UIMenuBuilder>, mtm: MainThread
         }
         // SAFETY: framework string constants.
         let application = unsafe { UIMenuApplication };
-        for identifier in replaced_system_menus() {
-            builder.removeMenuForIdentifier(identifier);
-        }
+        let system: Vec<(&'static objc2_ui_kit::UIMenuIdentifier, String)> = replaced_system_menus()
+            .into_iter()
+            .filter_map(|identifier| {
+                let title = builder.menuForIdentifier(identifier)?.title().to_string();
+                Some((identifier, title))
+            })
+            .collect();
+        let mut replaced = vec![false; system.len()];
+        let mut unmatched = Vec::new();
 
         for (position, node) in state.model.menus.iter().enumerate() {
             let Node::Submenu { title, items, .. } = node else {
@@ -262,8 +275,6 @@ pub(super) fn build(builder: &ProtocolObject<dyn UIMenuBuilder>, mtm: MainThread
             };
             let elements = elements(items, mtm);
             if position == 0 {
-                // The first menu is the application menu: keep the system's own title and merge
-                // our items in place of its default children.
                 let block = block2::RcBlock::new(move |_: NonNull<NSArray<UIMenuElement>>| {
                     NonNull::new(Retained::autorelease_ptr(elements.clone())).expect("non-null array")
                 });
@@ -271,23 +282,48 @@ pub(super) fn build(builder: &ProtocolObject<dyn UIMenuBuilder>, mtm: MainThread
                 unsafe {
                     builder.replaceChildrenOfMenuForIdentifier_fromChildrenBlock(application, &block);
                 }
-            } else {
-                let identifier = NSString::from_str(&format!("de.gpui.ios.menu.{position}"));
-                let menu = UIMenu::menuWithTitle_image_identifier_options_children(
-                    &NSString::from_str(title),
+                continue;
+            }
+
+            let identifier = NSString::from_str(&format!("de.gpui.ios.menu.{position}"));
+            let menu = UIMenu::menuWithTitle_image_identifier_options_children(
+                &NSString::from_str(title),
+                None,
+                Some(&identifier),
+                UIMenuOptions::empty(),
+                &elements,
+                mtm,
+            );
+            let counterpart = system.iter().enumerate().find(|(index, (_, system_title))| {
+                !replaced[*index] && system_title.trim().eq_ignore_ascii_case(title.trim())
+            });
+            let Some((index, (system_identifier, _))) = counterpart else {
+                unmatched.push(menu);
+                continue;
+            };
+            replaced[index] = true;
+            builder.replaceMenuForIdentifier_withMenu(system_identifier, &menu);
+            if builder.menuForIdentifier(&identifier).is_none() {
+                let inline = UIMenu::menuWithTitle_image_identifier_options_children(
+                    &NSString::new(),
                     None,
-                    Some(&identifier),
-                    UIMenuOptions::empty(),
+                    None,
+                    UIMenuOptions::DisplayInline,
                     &elements,
                     mtm,
                 );
-                let previous = if position == 1 {
-                    application.retain()
-                } else {
-                    NSString::from_str(&format!("de.gpui.ios.menu.{}", position - 1))
-                };
-                builder.insertSiblingMenu_afterMenuForIdentifier(&menu, &previous);
+                builder.insertChildMenu_atStartOfMenuForIdentifier(&inline, system_identifier);
             }
+        }
+
+        for (index, (identifier, _)) in system.iter().enumerate() {
+            if !replaced[index] {
+                builder.removeMenuForIdentifier(identifier);
+            }
+        }
+        // Inserting each directly after the application menu, last first, keeps their order.
+        for menu in unmatched.into_iter().rev() {
+            builder.insertSiblingMenu_afterMenuForIdentifier(&menu, application);
         }
     });
 }

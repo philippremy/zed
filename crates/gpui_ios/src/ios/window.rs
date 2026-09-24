@@ -289,6 +289,10 @@ impl std::ops::Deref for IosWindow {
 
 #[allow(clippy::type_complexity)]
 pub(crate) struct IosWindowState {
+    /// GPUI's handle for this window, reported by `Platform::active_window`
+    handle: AnyWindowHandle,
+    /// Whether the scene is currently active
+    active: Cell<bool>,
     /// The UIWindow object
     window: Retained<UIWindow>,
     /// The UIViewController
@@ -340,7 +344,7 @@ pub(crate) struct IosWindowState {
 
 impl IosWindow {
     #[allow(deprecated)] // Window construction can precede scene connection.
-    pub fn new(_handle: AnyWindowHandle, _params: WindowParams) -> anyhow::Result<Self> {
+    pub fn new(handle: AnyWindowHandle, _params: WindowParams) -> anyhow::Result<Self> {
         // Create the window on the main screen
         let screen = IosDisplay::main();
         let screen_bounds = screen.bounds();
@@ -423,6 +427,8 @@ impl IosWindow {
             renderer.update_drawable_size(size(DevicePixels(pixel_w), DevicePixels(pixel_h)));
 
             let state = IosWindowState {
+                handle,
+                active: Cell::new(false),
                 window,
                 view_controller,
                 view,
@@ -683,8 +689,17 @@ impl IosWindowState {
     }
 
     /// Notify the window when its UIKit scene becomes active or inactive.
+    pub(super) fn handle(&self) -> AnyWindowHandle {
+        self.handle
+    }
+
+    pub(super) fn is_active(&self) -> bool {
+        self.active.get()
+    }
+
     pub fn notify_active_status_change(&self, is_active: bool) {
         log::info!("GPUI iOS: Window active status changed to: {}", is_active);
+        self.active.set(is_active);
 
         self.active_status_callback
             .with(|callback| callback(is_active));

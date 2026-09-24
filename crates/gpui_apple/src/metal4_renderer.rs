@@ -1755,7 +1755,10 @@ impl Metal4Renderer {
             );
         }
 
-        let legacy_texture = self.sprite_atlas.metal_texture(texture_id);
+        let Some(legacy_texture) = self.sprite_atlas.metal_texture(texture_id) else {
+            log::warn!("metal4: skipping sprites whose atlas texture {texture_id:?} was released");
+            return;
+        };
         let texture: Retained<ProtocolObject<dyn MTLTexture>> =
             unsafe { bridge_retain(legacy_texture.as_ptr() as *mut c_void) };
 
@@ -1840,7 +1843,10 @@ impl Metal4Renderer {
             );
         }
 
-        let legacy_texture = self.sprite_atlas.metal_texture(texture_id);
+        let Some(legacy_texture) = self.sprite_atlas.metal_texture(texture_id) else {
+            log::warn!("metal4: skipping sprites whose atlas texture {texture_id:?} was released");
+            return;
+        };
         let texture: Retained<ProtocolObject<dyn MTLTexture>> =
             unsafe { bridge_retain(legacy_texture.as_ptr() as *mut c_void) };
 

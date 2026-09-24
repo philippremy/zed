@@ -71,7 +71,7 @@ pub struct TaffyLayoutEngine {
     // all. Only nodes whose inputs changed (and their ancestors) are recomputed.
     retain: bool,
     /// Previous frame's nodes by structural key, available for reuse this frame.
-    pool: FxHashMap<u64, Vec<NodeId>>,
+    pool: FxHashMap<u64, std::collections::VecDeque<NodeId>>,
     /// Nodes handed out this frame (created or reused) with their key, `0` = not poolable.
     live: Vec<(u64, NodeId)>,
     /// Reused measured leaves that taffy may not re-measure (a layout cache hit skips the
@@ -200,7 +200,7 @@ impl TaffyLayoutEngine {
             }
             for (key, node) in self.live.drain(..) {
                 if key != 0 {
-                    self.pool.entry(key).or_default().push(node);
+                    self.pool.entry(key).or_default().push_back(node);
                 }
             }
             self.pending_remeasure.clear();
@@ -226,7 +226,10 @@ impl TaffyLayoutEngine {
                 && self.taffy.style(candidate).is_ok_and(|s| s == style)
                 && self.taffy.child_ids(candidate).eq(LayoutId::to_taffy_slice(children).iter().copied())
         })?;
-        Some(bucket.swap_remove(position))
+        // Order-preserving: identical nodes (e.g. repeated labels) must be handed out in the order
+        // they were created. `swap_remove` permutes the bucket, so every frame would assign
+        // different duplicates to different parents and the parents' keys would never match.
+        bucket.remove(position)
     }
 
     fn structural_key(style: &taffy::Style, children: &[LayoutId], content_key: u64) -> u64 {

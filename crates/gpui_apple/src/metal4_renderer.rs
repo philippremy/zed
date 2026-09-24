@@ -1,13 +1,19 @@
-//! A Metal 4 renderer, built up one primitive at a time — now covering all
-//! six `gpui::Scene` primitive kinds: solid-color quads, underlines,
-//! shadows, monochrome sprites, polychrome sprites (the first two that
-//! sample a texture — see `draw_monochrome_sprites`), paths (the one
-//! genuinely different shape of problem among all of these — a two-pass
-//! rasterize-then-composite pipeline, see `draw_paths_to_intermediate`),
-//! and surfaces (video frames — `CVPixelBuffer`/`CVMetalTextureCache`
-//! interop, see `draw_surfaces`). See `draw()`'s doc comment for the exact
-//! current scope and its remaining, deliberate simplifications (fixed
-//! draw order rather than real scene z-order, chief among them).
+//! A Metal 4 renderer, built up one primitive at a time — now covering
+//! every `gpui::Scene` primitive kind that `MetalRenderer` itself actually
+//! draws: solid-color quads, underlines, shadows, monochrome sprites,
+//! polychrome sprites (the first two that sample a texture — see
+//! `draw_monochrome_sprites`), paths (the one genuinely different shape of
+//! problem among all of these — a two-pass rasterize-then-composite
+//! pipeline, see `draw_paths_to_intermediate`), and surfaces (video frames
+//! — `CVPixelBuffer`/`CVMetalTextureCache` interop, see `draw_surfaces`).
+//! `Scene` has an eighth field, `subpixel_sprites`, deliberately not ported
+//! here either: `MetalRenderer::draw()` itself has
+//! `PrimitiveBatch::SubpixelSprites { .. } => unreachable!()`, i.e. gpui
+//! doesn't currently produce that primitive in practice at this revision —
+//! not a gap relative to the real renderer, just matching its actual scope.
+//! See `draw()`'s doc comment for the exact current scope and its
+//! remaining, deliberate simplifications (fixed draw order rather than
+//! real scene z-order, chief among them).
 //!
 //! Ported from `metal_renderer.rs`'s device/layer setup (unchanged — Metal 4
 //! doesn't touch `CAMetalLayer`/drawable acquisition at all) but the

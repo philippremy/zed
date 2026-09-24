@@ -970,7 +970,7 @@ impl IosWindowState {
             return;
         }
 
-        log::info!(
+        log::trace!(
             "GPUI iOS: Layout changed — {:?} @{:.1}x → {:?} @{:.1}x",
             old_bounds.size,
             old_scale,

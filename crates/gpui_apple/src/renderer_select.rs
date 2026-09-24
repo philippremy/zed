@@ -5,12 +5,6 @@
 //! That indirection is what lets a second backend be added here later
 //! without touching window/display-link code at all: this module, and the
 //! `Renderer` enum in particular, is the only seam that needs to change.
-//!
-//! `V4(Metal4Renderer)` exists but is quads-only (see `metal4_renderer`'s
-//! module doc for scope and the reasoning behind it) and is never selected
-//! by default: it only activates when `metal4_available()` is true **and**
-//! `DTB_KE_GPU_BACKEND=metal4` is set, an opt-in for testing. Every other
-//! case constructs Metal 3, unchanged from before `V4` existed.
 
 use crate::metal4_renderer::Metal4Renderer;
 use crate::metal_atlas::MetalAtlas;

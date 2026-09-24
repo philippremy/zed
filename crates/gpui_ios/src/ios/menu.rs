@@ -247,18 +247,18 @@ fn ui_key_input(key: &str) -> Option<String> {
 
 /// Replace the system's main menu with the stored model. Called from `-buildMenuWithBuilder:`.
 ///
-/// Our first menu is the application menu: its items replace the children of the system one.
-/// Every other menu takes the place of the system menu with the same (localised) title, so the
-/// familiar order File / Edit / Window / Help is kept. Menus UIKit refuses to replace (Window and
-/// Help are special) get our items merged in at their start instead. System menus we do not
-/// provide are removed, and any of our menus with no system counterpart follow the application menu.
+/// Our first menu is the application menu. Every other menu goes to the system menu with the same
+/// (localised) title, which keeps the familiar order and titles. File and Edit have their children
+/// replaced. Window and Help are system-managed and come back if replaced or removed, so ours are
+/// merged in at their start. System menus we do not provide are removed; our menus with no
+/// counterpart follow the application menu.
 pub(super) fn build(builder: &ProtocolObject<dyn UIMenuBuilder>, mtm: MainThreadMarker) {
     STATE.with_borrow(|state| {
         if state.model.menus.is_empty() {
             return;
         }
         // SAFETY: framework string constants.
-        let application = unsafe { UIMenuApplication };
+        let (application, window_menu, help_menu) = unsafe { (UIMenuApplication, UIMenuWindow, UIMenuHelp) };
         let system: Vec<(&'static objc2_ui_kit::UIMenuIdentifier, String)> = replaced_system_menus()
             .into_iter()
             .filter_map(|identifier| {
@@ -266,58 +266,51 @@ pub(super) fn build(builder: &ProtocolObject<dyn UIMenuBuilder>, mtm: MainThread
                 Some((identifier, title))
             })
             .collect();
-        let mut replaced = vec![false; system.len()];
+        let mut claimed = vec![false; system.len()];
         let mut unmatched = Vec::new();
 
         for (position, node) in state.model.menus.iter().enumerate() {
             let Node::Submenu { title, items, .. } = node else {
                 continue;
             };
-            let elements = elements(items, mtm);
             if position == 0 {
-                let block = block2::RcBlock::new(move |_: NonNull<NSArray<UIMenuElement>>| {
-                    NonNull::new(Retained::autorelease_ptr(elements.clone())).expect("non-null array")
-                });
-                // SAFETY: the block returns an autoreleased array, as the API requires.
-                unsafe {
-                    builder.replaceChildrenOfMenuForIdentifier_fromChildrenBlock(application, &block);
-                }
+                replace_children(builder, application, elements(items, mtm));
                 continue;
             }
-
-            let identifier = NSString::from_str(&format!("de.gpui.ios.menu.{position}"));
-            let menu = UIMenu::menuWithTitle_image_identifier_options_children(
-                &NSString::from_str(title),
-                None,
-                Some(&identifier),
-                UIMenuOptions::empty(),
-                &elements,
-                mtm,
-            );
             let counterpart = system.iter().enumerate().find(|(index, (_, system_title))| {
-                !replaced[*index] && system_title.trim().eq_ignore_ascii_case(title.trim())
+                !claimed[*index] && system_title.trim().eq_ignore_ascii_case(title.trim())
             });
-            let Some((index, (system_identifier, _))) = counterpart else {
+            let Some((index, (identifier, _))) = counterpart else {
+                let menu = UIMenu::menuWithTitle_image_identifier_options_children(
+                    &NSString::from_str(title),
+                    None,
+                    Some(&NSString::from_str(&format!("de.gpui.ios.menu.{position}"))),
+                    UIMenuOptions::empty(),
+                    &elements(items, mtm),
+                    mtm,
+                );
                 unmatched.push(menu);
                 continue;
             };
-            replaced[index] = true;
-            builder.replaceMenuForIdentifier_withMenu(system_identifier, &menu);
-            if builder.menuForIdentifier(&identifier).is_none() {
+            claimed[index] = true;
+            if *identifier == window_menu || *identifier == help_menu {
                 let inline = UIMenu::menuWithTitle_image_identifier_options_children(
                     &NSString::new(),
                     None,
                     None,
                     UIMenuOptions::DisplayInline,
-                    &elements,
+                    &elements(items, mtm),
                     mtm,
                 );
-                builder.insertChildMenu_atStartOfMenuForIdentifier(&inline, system_identifier);
+                builder.insertChildMenu_atStartOfMenuForIdentifier(&inline, identifier);
+            } else {
+                replace_children(builder, identifier, elements(items, mtm));
             }
         }
 
         for (index, (identifier, _)) in system.iter().enumerate() {
-            if !replaced[index] {
+            let special = *identifier == window_menu || *identifier == help_menu;
+            if !claimed[index] && !special {
                 builder.removeMenuForIdentifier(identifier);
             }
         }
@@ -326,6 +319,20 @@ pub(super) fn build(builder: &ProtocolObject<dyn UIMenuBuilder>, mtm: MainThread
             builder.insertSiblingMenu_afterMenuForIdentifier(&menu, application);
         }
     });
+}
+
+fn replace_children(
+    builder: &ProtocolObject<dyn UIMenuBuilder>,
+    identifier: &objc2_ui_kit::UIMenuIdentifier,
+    elements: Retained<NSArray<UIMenuElement>>,
+) {
+    let block = block2::RcBlock::new(move |_: NonNull<NSArray<UIMenuElement>>| {
+        NonNull::new(Retained::autorelease_ptr(elements.clone())).expect("non-null array")
+    });
+    // SAFETY: the block returns an autoreleased array, as the API requires.
+    unsafe {
+        builder.replaceChildrenOfMenuForIdentifier_fromChildrenBlock(identifier, &block);
+    }
 }
 
 /// `items` as menu elements; separators split the list into inline groups.

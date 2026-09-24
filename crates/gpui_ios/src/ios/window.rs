@@ -86,6 +86,7 @@ impl WindowReference {
                 || (action == sel!(copy:) && actions.copy)
                 || (action == sel!(paste:) && actions.paste)
                 || (action == sel!(selectAll:) && actions.select_all)
+                || window.can_edit_from_menu_bar(action)
         })
         .unwrap_or(false)
     }
@@ -689,6 +690,24 @@ impl IosWindowState {
     }
 
     /// Notify the window when its UIKit scene becomes active or inactive.
+    /// Whether the main menu's Edit commands apply: a focused text input that takes text, with a
+    /// selection for cut and copy. (The touch edit menu supplies its own availability instead.)
+    fn can_edit_from_menu_bar(&self, action: Sel) -> bool {
+        let needs_selection = action == sel!(cut:) || action == sel!(copy:);
+        if !needs_selection && action != sel!(paste:) && action != sel!(selectAll:) {
+            return false;
+        }
+        self.input_handler
+            .with(|handler| {
+                handler.query_accepts_focused_text_input()
+                    && (!needs_selection
+                        || handler
+                            .selected_text_range(false)
+                            .is_some_and(|selection| !selection.range.is_empty()))
+            })
+            .unwrap_or(false)
+    }
+
     pub(super) fn handle(&self) -> AnyWindowHandle {
         self.handle
     }

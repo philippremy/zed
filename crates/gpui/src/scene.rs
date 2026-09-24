@@ -230,6 +230,46 @@ pub enum Primitive {
     Surface(PaintSurface),
 }
 
+impl Primitive {
+    /// A `Debug` rendering that leaves out the values that legitimately differ between two frames
+    /// painting the same thing (draw order, path ids). For comparing a replayed frame's primitives
+    /// against a freshly painted one.
+    pub(crate) fn debug_normalized(&self) -> String {
+        let text = match self {
+            Primitive::Shadow(p) => format!("Shadow({p:?})"),
+            Primitive::Quad(p) => format!("Quad({p:?})"),
+            Primitive::Path(p) => format!("Path({p:?})"),
+            Primitive::Underline(p) => format!("Underline({p:?})"),
+            Primitive::MonochromeSprite(p) => format!("MonochromeSprite({p:?})"),
+            Primitive::SubpixelSprite(p) => format!("SubpixelSprite({p:?})"),
+            Primitive::PolychromeSprite(p) => format!("PolychromeSprite({p:?})"),
+            Primitive::Surface(p) => format!("Surface({p:?})"),
+        };
+        strip_frame_local_numbers(&text)
+    }
+}
+
+/// Removes `order: N` and `PathId(N)` from a `Debug` string.
+fn strip_frame_local_numbers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let next = ["order: ", "PathId("]
+            .iter()
+            .filter_map(|needle| rest.find(needle).map(|at| (at, *needle)))
+            .min_by_key(|(at, _)| *at);
+        let Some((at, needle)) = next else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..at + needle.len()]);
+        rest = &rest[at + needle.len()..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        rest = &rest[digits..];
+    }
+    out
+}
+
 #[expect(missing_docs)]
 impl Primitive {
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {

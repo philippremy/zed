@@ -3857,6 +3857,142 @@ impl Window {
         sorted_indices
     }
 
+    /// Everything a view's prepaint contributed to `frame` in `range`, as comparable text per
+    /// category, leaving out values that legitimately differ between frames (hitbox ids).
+    pub(crate) fn summarize_prepaint(
+        frame: &Frame,
+        range: &Range<PrepaintStateIndex>,
+    ) -> Vec<(&'static str, Vec<String>)> {
+        vec![
+            (
+                "hitboxes",
+                frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
+                    .iter()
+                    .map(|h| format!("{:?} {:?} {:?}", h.bounds, h.content_mask, h.behavior))
+                    .collect(),
+            ),
+            (
+                "tooltips",
+                frame.tooltip_requests[range.start.tooltips_index..range.end.tooltips_index]
+                    .iter()
+                    .map(|t| if t.is_some() { "tooltip" } else { "none" }.to_string())
+                    .collect(),
+            ),
+            (
+                "deferred draws",
+                frame.deferred_draws[range.start.deferred_draws_index..range.end.deferred_draws_index]
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            "priority {} offset {:?} mask {:?} rem {:?}",
+                            d.priority, d.absolute_offset, d.content_mask, d.rem_size
+                        )
+                    })
+                    .collect(),
+            ),
+            (
+                "element states",
+                frame.accessed_element_states
+                    [range.start.accessed_element_states_index..range.end.accessed_element_states_index]
+                    .iter()
+                    .map(|(id, type_id)| format!("{id:?} {type_id:?}"))
+                    .collect(),
+            ),
+            (
+                "replayable effects",
+                vec!["effect".to_string(); range.end.effects_index - range.start.effects_index],
+            ),
+        ]
+    }
+
+    /// Like [`Self::summarize_prepaint`], for what a view painted.
+    pub(crate) fn summarize_paint(
+        frame: &Frame,
+        range: &Range<PaintIndex>,
+        prepaint_range: &Range<PrepaintStateIndex>,
+    ) -> Vec<(&'static str, Vec<String>)> {
+        vec![
+            // Key listeners, actions and key contexts attach to their dispatch nodes while painting,
+            // so nodes can only be compared once the view has been painted.
+            (
+                "dispatch nodes",
+                frame.dispatch_tree.summarize_nodes(
+                    prepaint_range.start.dispatch_tree_index..prepaint_range.end.dispatch_tree_index,
+                ),
+            ),
+            (
+                "scene",
+                frame.scene.paint_operations[range.start.scene_index..range.end.scene_index]
+                    .iter()
+                    .map(|op| match op {
+                        crate::scene::PaintOperation::Primitive(p) => p.debug_normalized(),
+                        crate::scene::PaintOperation::StartLayer(bounds) => {
+                            format!("StartLayer({bounds:?})")
+                        }
+                        crate::scene::PaintOperation::EndLayer => "EndLayer".to_string(),
+                    })
+                    .collect(),
+            ),
+            (
+                "mouse listeners",
+                vec![
+                    "listener".to_string();
+                    range.end.mouse_listeners_index - range.start.mouse_listeners_index
+                ],
+            ),
+            (
+                "input handlers",
+                vec![
+                    "handler".to_string();
+                    range.end.input_handlers_index - range.start.input_handlers_index
+                ],
+            ),
+            (
+                "cursor styles",
+                frame.cursor_styles[range.start.cursor_styles_index..range.end.cursor_styles_index]
+                    .iter()
+                    .map(|c| format!("{:?} hitbox {}", c.style, c.hitbox_id.is_some()))
+                    .collect(),
+            ),
+            (
+                "tab stops",
+                frame.tab_stops.insertion_history
+                    [range.start.tab_handle_index..range.end.tab_handle_index]
+                    .iter()
+                    .map(|op| match op {
+                        crate::TabStopOperation::Insert(_) => "insert".to_string(),
+                        crate::TabStopOperation::Group(index) => format!("group {index:?}"),
+                        crate::TabStopOperation::GroupEnd => "group end".to_string(),
+                    })
+                    .collect(),
+            ),
+        ]
+    }
+
+    /// Summaries of what `old_range` in the previous frame and `new_range` in the frame being
+    /// built contain, for [`diff_summaries`].
+    pub(crate) fn prepaint_summaries(
+        &self,
+        old_range: &Range<PrepaintStateIndex>,
+        new_range: &Range<PrepaintStateIndex>,
+    ) -> (Vec<(&'static str, Vec<String>)>, Vec<(&'static str, Vec<String>)>) {
+        (
+            Self::summarize_prepaint(&self.rendered_frame, old_range),
+            Self::summarize_prepaint(&self.next_frame, new_range),
+        )
+    }
+
+    pub(crate) fn paint_summaries(
+        &self,
+        old: (&Range<PaintIndex>, &Range<PrepaintStateIndex>),
+        new: (&Range<PaintIndex>, &Range<PrepaintStateIndex>),
+    ) -> (Vec<(&'static str, Vec<String>)>, Vec<(&'static str, Vec<String>)>) {
+        (
+            Self::summarize_paint(&self.rendered_frame, old.0, old.1),
+            Self::summarize_paint(&self.next_frame, new.0, new.1),
+        )
+    }
+
     pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
         PrepaintStateIndex {
             hitboxes_index: self.next_frame.hitboxes.len(),
@@ -9384,4 +9520,30 @@ mod inspector_tests {
         })
         .expect("closed inspector has no bookkeeping and no style overrides");
     }
+}
+
+/// Describes every category in which two summaries of the same view differ.
+pub(crate) fn diff_summaries(
+    cached: &[(&'static str, Vec<String>)],
+    fresh: &[(&'static str, Vec<String>)],
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    for ((category, cached), (_, fresh)) in cached.iter().zip(fresh) {
+        if cached.len() != fresh.len() {
+            problems.push(format!(
+                "{category}: {} when cached but {} when fresh",
+                cached.len(),
+                fresh.len()
+            ));
+        }
+        if let Some(index) = cached.iter().zip(fresh).position(|(a, b)| a != b) {
+            let clip = |text: &str| text.chars().take(400).collect::<String>();
+            problems.push(format!(
+                "{category} #{index}: cached {} / fresh {}",
+                clip(&cached[index]),
+                clip(&fresh[index])
+            ));
+        }
+    }
+    problems
 }

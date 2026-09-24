@@ -585,6 +585,32 @@ impl DispatchTree {
         focus_path
     }
 
+    /// One line per node in `range` describing everything about it that does not depend on where it
+    /// sits in the frame. For comparing a reused subtree against a freshly built one.
+    pub(crate) fn summarize_nodes(&self, range: std::ops::Range<usize>) -> Vec<String> {
+        self.nodes[range.clone()]
+            .iter()
+            .map(|node| {
+                let parent = match node.parent {
+                    Some(parent) if range.contains(&parent.0) => {
+                        format!("+{}", parent.0 - range.start)
+                    }
+                    Some(_) => "outside".to_string(),
+                    None => "none".to_string(),
+                };
+                format!(
+                    "parent {parent} key_listeners {} actions {} modifiers_listeners {} context {:?} focusable {} view {}",
+                    node.key_listeners.len(),
+                    node.action_listeners.len(),
+                    node.modifiers_changed_listeners.len(),
+                    node.context,
+                    node.focus_id.is_some(),
+                    node.view_id.is_some(),
+                )
+            })
+            .collect()
+    }
+
     pub fn view_path_reversed(&self, view_id: EntityId) -> impl Iterator<Item = EntityId> {
         let mut current_node_id = self.view_node_ids.get(&view_id).copied();
 

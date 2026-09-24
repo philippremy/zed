@@ -298,6 +298,16 @@ struct ViewElementState {
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
     deps: ViewDeps,
+    /// Verify mode: the paint range of the output that would have been replayed, to compare with
+    /// what painting the fresh render produces. See [`verify_enabled`].
+    verify_pending: Option<VerifyPending>,
+}
+
+struct VerifyPending {
+    old_paint: Range<PaintIndex>,
+    old_prepaint: Range<PrepaintStateIndex>,
+    prepaint_ok: bool,
+    source: Option<&'static core::panic::Location<'static>>,
 }
 
 /// What a cached view's rendered output depends on besides its own notifications, so that it is
@@ -370,28 +380,60 @@ enum CacheOutcome {
     Bounds,
     Mask,
     TextStyle,
+    Ambient,
     Dirty,
     Refreshing,
     EntityDep,
     GlobalDep,
     Input,
+    Verified,
+    Mismatch,
 }
 
-const CACHE_OUTCOMES: [&str; 10] = [
+const CACHE_OUTCOMES: [&str; 13] = [
     "hit",
     "first",
     "bounds",
     "mask",
     "text_style",
+    "ambient",
     "dirty",
     "refreshing",
     "entity_dep",
     "global_dep",
     "input",
+    "verified",
+    "MISMATCH",
 ];
 
-static CACHE_STATS: [std::sync::atomic::AtomicU64; 10] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+static CACHE_STATS: [std::sync::atomic::AtomicU64; 13] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 13];
+
+
+/// `DTB_KE_VIEW_CACHE_VERIFY=1`: whenever a cached view would be reused, render and paint it afresh
+/// anyway (so the frame is always correct) and compare the result with what reusing it would have
+/// produced, logging every difference. Finds views whose output depends on something the cache
+/// doesn't track.
+fn verify_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("DTB_KE_VIEW_CACHE_VERIFY").is_some())
+}
+
+/// Logs the differences found for the view created at `source`, once per distinct set.
+fn report_mismatch(entity_id: EntityId, source: Option<&'static core::panic::Location<'static>>, problems: &[String]) {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let origin = source.map_or_else(
+        || format!("{entity_id:?}"),
+        |source| format!("{source} ({entity_id:?})"),
+    );
+    let summary = problems.join("; ");
+    let key = format!("{origin} {summary}");
+    let mut seen = SEEN.lock().unwrap();
+    if !seen.contains(&key) {
+        seen.push(key);
+        log::error!("cached view verification failed for the view cached at {origin}: {summary}");
+    }
+}
 
 fn record_outcome(outcome: CacheOutcome) {
     CACHE_STATS[outcome as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -411,6 +453,10 @@ struct ViewElementCacheKey {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
+    /// Ambient state a view is painted under without owning: an animated ancestor's opacity, or a
+    /// rem size override. Either changing changes what the view paints.
+    opacity: f32,
+    rem_size: Pixels,
 }
 
 impl<V: View> Element for ViewElement<V> {
@@ -471,6 +517,10 @@ impl<V: View> Element for ViewElement<V> {
             // Stateful path.
             prepaint_view(
                 entity_id,
+                #[cfg(debug_assertions)]
+                Some(self.source),
+                #[cfg(not(debug_assertions))]
+                None,
                 global_id,
                 bounds,
                 element,
@@ -569,6 +619,7 @@ fn request_layout_component(
 #[inline(never)]
 fn prepaint_view(
     entity_id: EntityId,
+    source: Option<&'static core::panic::Location<'static>>,
     global_id: Option<&GlobalElementId>,
     bounds: Bounds<Pixels>,
     element: &mut Option<AnyElement>,
@@ -588,6 +639,8 @@ fn prepaint_view(
             |element_state, window| {
                 let content_mask = window.content_mask();
                 let text_style = window.text_style();
+                let opacity = window.element_opacity();
+                let rem_size = window.rem_size();
 
                 let outcome = match &element_state {
                     None => CacheOutcome::First,
@@ -595,6 +648,12 @@ fn prepaint_view(
                     Some(state) if state.cache_key.content_mask != content_mask => CacheOutcome::Mask,
                     Some(state) if state.cache_key.text_style != text_style => {
                         CacheOutcome::TextStyle
+                    }
+                    Some(state)
+                        if state.cache_key.opacity != opacity
+                            || state.cache_key.rem_size != rem_size =>
+                    {
+                        CacheOutcome::Ambient
                     }
                     Some(_) if window.dirty_views.contains(&entity_id) => CacheOutcome::Dirty,
                     Some(_) if window.refreshing => CacheOutcome::Refreshing,
@@ -605,7 +664,16 @@ fn prepaint_view(
                 };
                 record_outcome(outcome);
 
-                if let (CacheOutcome::Hit, Some(mut element_state)) = (outcome, element_state) {
+                let verifying = matches!(outcome, CacheOutcome::Hit) && verify_enabled();
+                let mut verify_old = None;
+                if verifying {
+                    let state = element_state.as_ref().unwrap();
+                    verify_old = Some((state.prepaint_range.clone(), state.paint_range.clone()));
+                }
+
+                if let (CacheOutcome::Hit, Some(mut element_state), false) =
+                    (outcome, element_state, verifying)
+                {
                     let prepaint_start = window.prepaint_index();
                     window.reuse_prepaint(element_state.prepaint_range.clone(), cx);
                     cx.entities
@@ -636,6 +704,23 @@ fn prepaint_view(
 
                 let prepaint_end = window.prepaint_index();
                 window.refreshing = refreshing;
+
+                let mut verify_pending = None;
+                if let Some((old_prepaint, old_paint)) = verify_old {
+                    let new_prepaint = prepaint_start.clone()..prepaint_end.clone();
+                    let (cached, fresh) = window.prepaint_summaries(&old_prepaint, &new_prepaint);
+                    let problems = crate::window::diff_summaries(&cached, &fresh);
+                    if !problems.is_empty() {
+                        record_outcome(CacheOutcome::Mismatch);
+                        report_mismatch(entity_id, source, &problems);
+                    }
+                    verify_pending = Some(VerifyPending {
+                        old_paint,
+                        old_prepaint,
+                        prepaint_ok: problems.is_empty(),
+                        source,
+                    });
+                }
                 let inputs = window.input_reads.get();
                 window.input_reads.set(outer_input_reads | inputs);
                 let deps = ViewDeps::capture(cx, window, &accessed_entities, accessed_globals, inputs);
@@ -644,6 +729,7 @@ fn prepaint_view(
                     Some(element),
                     ViewElementState {
                         deps,
+                        verify_pending,
                         accessed_entities,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
@@ -651,6 +737,8 @@ fn prepaint_view(
                             bounds,
                             content_mask,
                             text_style,
+                            opacity,
+                            rem_size,
                         },
                     },
                 )
@@ -705,6 +793,20 @@ fn paint_view(
 
                     let paint_end = window.paint_index();
                     element_state.paint_range = paint_start..paint_end;
+
+                    if let Some(pending) = element_state.verify_pending.take() {
+                        let (cached, fresh) = window.paint_summaries(
+                            (&pending.old_paint, &pending.old_prepaint),
+                            (&element_state.paint_range, &element_state.prepaint_range),
+                        );
+                        let problems = crate::window::diff_summaries(&cached, &fresh);
+                        if !problems.is_empty() {
+                            record_outcome(CacheOutcome::Mismatch);
+                            report_mismatch(entity_id, pending.source, &problems);
+                        } else if pending.prepaint_ok {
+                            record_outcome(CacheOutcome::Verified);
+                        }
+                    }
 
                     ((), element_state)
                 },

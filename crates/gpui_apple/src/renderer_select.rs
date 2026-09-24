@@ -31,12 +31,6 @@ pub enum Renderer {
     V4(Metal4Renderer),
 }
 
-fn metal4_opt_in() -> bool {
-    std::env::var("DTB_KE_GPU_BACKEND")
-        .map(|value| value.eq_ignore_ascii_case("metal4"))
-        .unwrap_or(false)
-}
-
 pub unsafe fn new_renderer(
     context: Context,
     native_window: *mut c_void,
@@ -44,13 +38,10 @@ pub unsafe fn new_renderer(
     bounds: Size<f32>,
     transparent: bool,
 ) -> Renderer {
-    let metal4_available = crate::metal4_capability::metal4_available();
-    let use_metal4 = metal4_available && metal4_opt_in();
+    let use_metal4 = crate::metal4_capability::metal4_available();
     log::debug!(
-        "gpu backend: metal4 available = {}, opt-in = {}, selecting {}",
-        metal4_available,
-        metal4_opt_in(),
-        if use_metal4 { "metal4" } else { "metal3" }
+        "gpu backend: using {}",
+        if use_metal4 { "Metal 4" } else { "Metal 3" }
     );
 
     if use_metal4 {

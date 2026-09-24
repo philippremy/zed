@@ -1,11 +1,20 @@
-#![cfg(target_os = "macos")]
-//! Shared Apple platform support for GPUI.
+#![cfg(any(target_os = "macos", target_os = "ios"))]
+//! Shared Apple rendering and task dispatch for GPUI.
 //!
-//! This crate contains the Metal renderer and GPU resource management shared
-//! by GPUI's Apple platform backends.
+//! This crate renders GPUI scenes directly with Metal on Apple platforms. It
+//! owns GPU resources and shaders while leaving application lifecycle,
+//! windowing, and input to each platform backend.
 
+<<<<<<< HEAD
 mod metal4_capability;
 mod metal4_renderer;
 mod metal_atlas;
 pub mod metal_renderer;
 pub mod renderer_select;
+=======
+mod dispatcher;
+mod metal_atlas;
+pub mod metal_renderer;
+
+pub use dispatcher::{AppleDispatcher, MacActivity};
+>>>>>>> ios-pr

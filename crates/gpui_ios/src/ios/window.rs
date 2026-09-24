@@ -21,7 +21,8 @@ use gpui::{
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets,
     WindowParams, WindowVisibility, px, size,
 };
-use gpui_apple::metal_renderer::{Context as MetalContext, MetalRenderer};
+use gpui_apple::metal_renderer::Context as MetalContext;
+use gpui_apple::renderer_select::{Renderer, new_renderer_for_layer};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{
@@ -412,7 +413,7 @@ pub(crate) struct IosWindowState {
     mouse_position: Cell<Point<Pixels>>,
     /// Current modifiers
     modifiers: Cell<Modifiers>,
-    renderer: Mutex<MetalRenderer>,
+    renderer: Mutex<Renderer>,
     background: Cell<WindowBackgroundAppearance>,
 }
 
@@ -493,7 +494,7 @@ impl IosWindow {
 
             let pixel_w = (screen_bounds_cg.size.width * scale) as i32;
             let pixel_h = (screen_bounds_cg.size.height * scale) as i32;
-            let mut renderer = MetalRenderer::from_layer(
+            let mut renderer = new_renderer_for_layer(
                 MetalContext::default(),
                 Retained::as_ptr(&layer)
                     .cast_mut()

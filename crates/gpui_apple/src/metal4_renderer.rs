@@ -67,7 +67,9 @@
 
 use crate::metal_atlas::MetalAtlas;
 use crate::metal_renderer::{PathRasterizationVertex, PathSprite, SurfaceBounds};
+#[cfg(target_os = "macos")]
 use core_foundation::base::TCFType;
+#[cfg(target_os = "macos")]
 use core_video::{
     metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
     pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
@@ -257,6 +259,7 @@ pub struct Metal4Renderer {
     /// `PaintSurface`'s `CVPixelBuffer` every `draw_surfaces` call — a real
     /// GPU-texture cache, not something this renderer manages itself; kept
     /// alive for the renderer's whole lifetime like `MetalRenderer`'s own.
+    #[cfg(target_os = "macos")]
     core_video_texture_cache: CVMetalTextureCache,
     /// Never written after construction (the constant unit quad), so —
     /// unlike every buffer below — it needs no per-slot copy: there's
@@ -402,25 +405,44 @@ pub struct Metal4Renderer {
 }
 
 impl Metal4Renderer {
+    #[cfg(target_os = "macos")]
     pub fn new(transparent: bool) -> Self {
         let device = Self::create_device();
 
         let layer = metal::MetalLayer::new();
-        layer.set_device(&device);
+        Self::configure_layer(&layer, &device, transparent);
+        unsafe {
+            let _: () = msg_send![&*layer, setAutoresizingMask: 18_u32];
+        }
+
+        Self::new_internal(device, Some(layer), !transparent)
+    }
+
+    /// Creates a renderer for a `CAMetalLayer` owned by a platform view (iOS: the view's own
+    /// backing layer).
+    ///
+    /// # Safety
+    ///
+    /// `layer` must point to a live `CAMetalLayer` and only be used from the thread its owning
+    /// view may be accessed on.
+    #[cfg(target_os = "ios")]
+    pub unsafe fn from_layer(layer: *mut metal::CAMetalLayer, transparent: bool) -> Self {
+        let device = Self::create_device();
+        let retained_layer: *mut metal::CAMetalLayer = unsafe { msg_send![layer, retain] };
+        let layer = unsafe { metal::MetalLayer::from_ptr(retained_layer) };
+        Self::configure_layer(&layer, &device, transparent);
+        Self::new_internal(device, Some(layer), !transparent)
+    }
+
+    fn configure_layer(layer: &metal::MetalLayerRef, device: &metal::DeviceRef, transparent: bool) {
+        layer.set_device(device);
         layer.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
         layer.set_opaque(!transparent);
         layer.set_maximum_drawable_count(3);
         unsafe {
-            let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: cocoa::base::NO];
-            let _: () = msg_send![&*layer, setNeedsDisplayOnBoundsChange: cocoa::base::YES];
-            let _: () = msg_send![
-                &*layer,
-                setAutoresizingMask: cocoa::quartzcore::AutoresizingMask::WIDTH_SIZABLE
-                    | cocoa::quartzcore::AutoresizingMask::HEIGHT_SIZABLE
-            ];
+            let _: () = msg_send![layer, setAllowsNextDrawableTimeout: objc::runtime::NO];
+            let _: () = msg_send![layer, setNeedsDisplayOnBoundsChange: objc::runtime::YES];
         }
-
-        Self::new_internal(device, Some(layer), !transparent)
     }
 
     /// Creates a Metal4Renderer with no `CAMetalLayer`, for offscreen
@@ -432,6 +454,15 @@ impl Metal4Renderer {
         Self::new_internal(device, None, true)
     }
 
+    #[cfg(target_os = "ios")]
+    fn create_device() -> metal::Device {
+        metal::Device::system_default().unwrap_or_else(|| {
+            log::error!("metal4: unable to access a compatible graphics device");
+            std::process::exit(1);
+        })
+    }
+
+    #[cfg(target_os = "macos")]
     fn create_device() -> metal::Device {
         if let Some(d) = metal::Device::all()
             .into_iter()
@@ -667,6 +698,7 @@ impl Metal4Renderer {
             &residency_set,
             mem::size_of::<SurfaceBounds>(),
         );
+        #[cfg(target_os = "macos")]
         let core_video_texture_cache = CVMetalTextureCache::new(None, device.clone(), None)
             .expect("metal4: could not create a CVMetalTextureCache");
 
@@ -738,6 +770,7 @@ impl Metal4Renderer {
             path_rasterization_pipeline_state,
             path_sprite_pipeline_state,
             surface_pipeline_state,
+            #[cfg(target_os = "macos")]
             core_video_texture_cache,
             unit_vertices,
             viewport_size_buffer,
@@ -1030,13 +1063,10 @@ impl Metal4Renderer {
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         if let Some(layer) = &self.layer {
-            let ns_size = cocoa::foundation::NSSize {
-                width: size.width.0 as f64,
-                height: size.height.0 as f64,
-            };
-            unsafe {
-                let _: () = msg_send![layer.as_ref(), setDrawableSize: ns_size];
-            }
+            layer.set_drawable_size(core_graphics::geometry::CGSize::new(
+                size.width.0 as f64,
+                size.height.0 as f64,
+            ));
         }
     }
 
@@ -2195,6 +2225,16 @@ impl Metal4Renderer {
         }
     }
 
+    /// Video surfaces are macOS-only (`PaintSurface` carries no pixel buffer on iOS).
+    #[cfg(target_os = "ios")]
+    fn draw_surfaces(
+        &self,
+        _surfaces: &[PaintSurface],
+        _viewport_size: Size<DevicePixels>,
+        _encoder: &ProtocolObject<dyn MTL4RenderCommandEncoder>,
+    ) {
+    }
+
     /// One `PaintSurface` (a video frame) at a time, unlike every other
     /// primitive — each has its own pair of Y/CbCr textures pulled fresh
     /// from `core_video_texture_cache` every call, so there's no batching
@@ -2210,6 +2250,7 @@ impl Metal4Renderer {
     /// `draw_polychrome_sprites` can assume for their atlas textures), this
     /// removes last call's two textures from `residency_set` before adding
     /// this call's, rather than letting stale entries accumulate forever.
+    #[cfg(target_os = "macos")]
     fn draw_surfaces(
         &self,
         surfaces: &[PaintSurface],

@@ -25,6 +25,7 @@ pub enum Renderer {
     V4(Metal4Renderer),
 }
 
+#[cfg(target_os = "macos")]
 pub unsafe fn new_renderer(
     context: Context,
     native_window: *mut c_void,
@@ -50,6 +51,30 @@ pub unsafe fn new_renderer(
                 transparent,
             )
         })
+    }
+}
+
+/// Builds the renderer for a `CAMetalLayer` a platform view already owns (iOS): Metal 4 when
+/// the OS is 26+ and the GPU reports the Metal 4 family, else Metal 3.
+///
+/// # Safety
+///
+/// `layer` must point to a live `CAMetalLayer` used only from its view's thread.
+#[cfg(target_os = "ios")]
+pub unsafe fn new_renderer_for_layer(
+    context: Context,
+    layer: *mut metal::CAMetalLayer,
+    transparent: bool,
+) -> Renderer {
+    let use_metal4 = crate::metal4_capability::metal4_available();
+    log::debug!(
+        "gpu backend: using {}",
+        if use_metal4 { "Metal 4" } else { "Metal 3" }
+    );
+    if use_metal4 {
+        Renderer::V4(unsafe { Metal4Renderer::from_layer(layer, transparent) })
+    } else {
+        Renderer::V3(unsafe { MetalRenderer::from_layer(context, layer, transparent) })
     }
 }
 

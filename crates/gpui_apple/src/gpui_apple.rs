@@ -6,13 +6,10 @@
 //! windowing, and input to each platform backend.
 
 mod dispatcher;
-#[cfg(target_os = "macos")]
 mod metal4_capability;
-#[cfg(target_os = "macos")]
 mod metal4_renderer;
 mod metal_atlas;
 pub mod metal_renderer;
-#[cfg(target_os = "macos")]
 pub mod renderer_select;
 
 pub use dispatcher::{AppleDispatcher, MacActivity};

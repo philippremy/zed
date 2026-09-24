@@ -11,9 +11,13 @@
 //! selected — see `renderer_select`, which is the only caller.
 
 use objc2_foundation::{NSOperatingSystemVersion, NSProcessInfo};
-use objc2_metal::{MTLCopyAllDevices, MTLDevice, MTLGPUFamily};
+#[cfg(target_os = "macos")]
+use objc2_metal::MTLCopyAllDevices;
+#[cfg(target_os = "ios")]
+use objc2_metal::MTLCreateSystemDefaultDevice;
+use objc2_metal::{MTLDevice, MTLGPUFamily};
 
-const MIN_MACOS_VERSION: NSOperatingSystemVersion = NSOperatingSystemVersion {
+const MIN_OS_VERSION: NSOperatingSystemVersion = NSOperatingSystemVersion {
     majorVersion: 26,
     minorVersion: 0,
     patchVersion: 0,
@@ -25,12 +29,21 @@ const MIN_MACOS_VERSION: NSOperatingSystemVersion = NSOperatingSystemVersion {
 /// falls through to a device query when that gate passes.
 pub fn metal4_available() -> bool {
     let os_supports_metal4 =
-        NSProcessInfo::processInfo().isOperatingSystemAtLeastVersion(MIN_MACOS_VERSION);
+        NSProcessInfo::processInfo().isOperatingSystemAtLeastVersion(MIN_OS_VERSION);
     if !os_supports_metal4 {
         return false;
     }
 
-    MTLCopyAllDevices()
-        .iter()
-        .any(|device| device.supportsFamily(MTLGPUFamily::Metal4))
+    #[cfg(target_os = "macos")]
+    {
+        MTLCopyAllDevices()
+            .iter()
+            .any(|device| device.supportsFamily(MTLGPUFamily::Metal4))
+    }
+    // iOS / iPadOS: the one GPU is the system default device (iOS 26 aligns with macOS 26).
+    #[cfg(target_os = "ios")]
+    {
+        MTLCreateSystemDefaultDevice()
+            .is_some_and(|device| device.supportsFamily(MTLGPUFamily::Metal4))
+    }
 }

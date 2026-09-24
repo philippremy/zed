@@ -413,6 +413,7 @@ pub(crate) struct IosWindowState {
     /// Current modifiers
     modifiers: Cell<Modifiers>,
     renderer: Mutex<MetalRenderer>,
+    background: Cell<WindowBackgroundAppearance>,
 }
 
 impl IosWindow {
@@ -535,6 +536,7 @@ impl IosWindow {
                 mouse_position: Cell::new(Point::default()),
                 modifiers: Cell::new(Modifiers::default()),
                 renderer: Mutex::new(renderer),
+                background: Cell::new(WindowBackgroundAppearance::Opaque),
             };
 
             Ok(Self {
@@ -1161,11 +1163,18 @@ impl PlatformWindow for IosWindow {
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
-        WindowBackgroundAppearance::Opaque
+        self.background.get()
     }
 
-    fn set_background_appearance(&self, _background_appearance: WindowBackgroundAppearance) {
-        // Could adjust view background color
+    /// Anything but `Opaque` makes the Metal layer transparent so views placed beneath it (an
+    /// app's own `UIVisualEffectView`s) show through where GPUI paints nothing. iOS has no window
+    /// blur of its own, so `Blurred` and the Windows-only materials are treated as `Transparent`.
+    fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
+        self.background.set(background_appearance);
+        let transparent = background_appearance != WindowBackgroundAppearance::Opaque;
+        self.renderer.lock().update_transparency(transparent);
+        self.view.setOpaque(!transparent);
+        self.force_next_frame.set(true);
     }
 
     fn minimize(&self) {

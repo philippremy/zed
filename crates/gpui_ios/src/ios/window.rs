@@ -35,7 +35,8 @@ use objc2_ui_kit::{
     UIResponderStandardEditActions, UIStatusBarStyle,
 };
 use objc2_ui_kit::{
-    UIEdgeInsets, UIEditMenuConfiguration, UIEditMenuInteraction, UIEvent, UIScreen, UITouch,
+    UICoordinateSpace, UIEdgeInsets, UIEditMenuConfiguration, UIEditMenuInteraction, UIEvent,
+    UIScreen, UITouch,
     UITraitCollection, UITraitEnvironment, UIUserInterfaceStyle, UIView, UIViewAutoresizing,
     UIViewController, UIViewLayoutRegion, UIViewLayoutRegionAdaptivityAxis, UIWindow,
     UIWindowScene,
@@ -334,6 +335,10 @@ pub(crate) struct IosWindowState {
     /// Callback for appearance changes
     appearance_changed_callback: CallbackSlot<Box<dyn FnMut()>>,
     insets_changed_callback: CallbackSlot<Box<dyn FnMut(WindowInsets)>>,
+    /// The insets last reported through [`Self::notify_insets_changed`].
+    last_insets: RefCell<WindowInsets>,
+    /// Counts frames, to run the geometry check only every few of them.
+    geometry_tick: Cell<u32>,
     keyboard_dismiss_callback: CallbackSlot<Box<dyn FnMut()>>,
     keyboard_dismiss_touch: Cell<Option<KeyboardDismissTouch>>,
     keyboard_height: Cell<f32>,
@@ -454,6 +459,8 @@ impl IosWindow {
                 close_callback: CallbackSlot::default(),
                 appearance_changed_callback: CallbackSlot::default(),
                 insets_changed_callback: CallbackSlot::default(),
+                last_insets: RefCell::new(WindowInsets::default()),
+                geometry_tick: Cell::new(0),
                 keyboard_dismiss_callback: CallbackSlot::default(),
                 keyboard_dismiss_touch: Cell::new(None),
                 keyboard_height: Cell::new(0.),
@@ -593,6 +600,7 @@ impl IosWindowState {
     }
 
     pub(super) fn request_frame(&self) {
+        self.sync_geometry();
         self.request_frame_callback.with(|callback| {
             let force_render = self.force_next_frame.replace(false);
             callback(RequestFrameOptions {
@@ -600,6 +608,44 @@ impl IosWindowState {
                 ..Default::default()
             });
         });
+    }
+
+    /// Reconcile what GPUI was told with what UIKit currently says. UIKit does not always announce a
+    /// change: a window created before its scene reports the scene's real size (a Stage Manager
+    /// window that was resized before the app was launched) keeps the screen-sized frame it was
+    /// given, and the window-controls insets can appear after the last layout pass. Every few
+    /// frames, fit the window to its scene, then report a size or inset change GPUI missed.
+    fn sync_geometry(&self) {
+        let tick = self.geometry_tick.get().wrapping_add(1);
+        self.geometry_tick.set(tick);
+        if tick % 6 != 0 {
+            return;
+        }
+        if let Some(scene) = super::application::window_scene() {
+            #[allow(deprecated)]
+            let scene_bounds = scene.coordinateSpace().bounds();
+            let frame = self.window.frame();
+            if (frame.size.width - scene_bounds.size.width).abs() > 0.5
+                || (frame.size.height - scene_bounds.size.height).abs() > 0.5
+            {
+                log::debug!(
+                    "GPUI iOS: fitting the window ({:?}) to its scene ({:?})",
+                    frame.size,
+                    scene_bounds.size
+                );
+                self.window.setFrame(scene_bounds);
+                self.view.setNeedsLayout();
+            }
+        }
+        let view_size = self.view.bounds().size;
+        let stored = self.bounds.get().size;
+        if (view_size.width as f32 - f32::from(stored.width)).abs() > 0.5
+            || (view_size.height as f32 - f32::from(stored.height)).abs() > 0.5
+        {
+            self.handle_layout_change();
+        } else if *self.last_insets.borrow() != self.current_insets() {
+            self.notify_insets_changed();
+        }
     }
 
     /// Query the safe area insets from the UIView.
@@ -680,6 +726,7 @@ impl IosWindowState {
 
     fn notify_insets_changed(&self) {
         let insets = self.current_insets();
+        *self.last_insets.borrow_mut() = insets.clone();
         // Fires on every layout pass (each frame while a window is being resized), so trace only.
         log::trace!(
             "GPUI iOS: insets — safe {:?}, window controls {:?}; window {:?} on screen {:?} (covers: {})",

@@ -269,6 +269,10 @@ impl WindowInvalidator {
         self.inner.borrow().draw_phase == DrawPhase::None
     }
 
+    pub(crate) fn in_draw(&self) -> bool {
+        !self.not_drawing()
+    }
+
     #[track_caller]
     pub fn debug_assert_paint(&self) {
         debug_assert!(
@@ -945,7 +949,7 @@ impl TooltipId {
             .as_ref()
             .is_some_and(|tooltip_bounds| {
                 tooltip_bounds.id == *self
-                    && tooltip_bounds.bounds.contains(&window.mouse_position())
+                    && tooltip_bounds.bounds.contains(&window.mouse_position_untracked())
             })
     }
 }
@@ -974,6 +978,10 @@ pub(crate) struct DeferredDraw {
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
 }
+
+/// Bits of [`Window::input_reads`].
+pub(crate) const INPUT_MOUSE: u8 = 1;
+pub(crate) const INPUT_MODIFIERS: u8 = 2;
 
 /// A prepaint side effect that must run again whenever the view that recorded it is reused from
 /// the previous frame instead of being re-prepainted. See [`Window::replayable_effect`].
@@ -1232,6 +1240,10 @@ pub struct Window {
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
+    /// Which continuously-changing inputs ([`INPUT_MOUSE`], [`INPUT_MODIFIERS`]) have been read
+    /// during the current draw. A cached view records the values it saw and is only reused while
+    /// they are unchanged; see [`Window::mouse_position`].
+    pub(crate) input_reads: Cell<u8>,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -2089,6 +2101,7 @@ impl Window {
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
+            input_reads: Cell::new(0),
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -3209,8 +3222,27 @@ impl Window {
     }
 
     /// The position of the mouse relative to the window.
+    ///
+    /// Reading it while an element is being drawn ties the enclosing cached view (see
+    /// [`crate::AnyView::cached`]) to the value it saw: nothing notifies a view when the mouse
+    /// moves, so the view is only reused while the position is unchanged. Reading it from an
+    /// event handler has no such effect.
     pub fn mouse_position(&self) -> Point<Pixels> {
+        self.note_input_read(INPUT_MOUSE);
         self.mouse_position
+    }
+
+    /// [`Self::mouse_position`] for gpui's own elements, whose dependence on the mouse is already
+    /// covered by their own invalidation (hover state, tooltips) and so shouldn't stop a cached
+    /// view from being reused.
+    pub(crate) fn mouse_position_untracked(&self) -> Point<Pixels> {
+        self.mouse_position
+    }
+
+    fn note_input_read(&self, input: u8) {
+        if self.invalidator.in_draw() {
+            self.input_reads.set(self.input_reads.get() | input);
+        }
     }
 
     /// Captures the pointer for the given hitbox. While captured, all mouse move and mouse up
@@ -3247,8 +3279,17 @@ impl Window {
         self.long_press_capture == Some(entity.entity_id())
     }
 
-    /// The current state of the keyboard's modifiers
+    /// The current state of the keyboard's modifiers.
+    ///
+    /// Like [`Self::mouse_position`], reading this while an element is being drawn ties the
+    /// enclosing cached view to the value it saw.
     pub fn modifiers(&self) -> Modifiers {
+        self.note_input_read(INPUT_MODIFIERS);
+        self.modifiers
+    }
+
+    /// [`Self::modifiers`] for gpui's own elements; see [`Self::mouse_position_untracked`].
+    pub(crate) fn modifiers_untracked(&self) -> Modifiers {
         self.modifiers
     }
 
@@ -3573,7 +3614,7 @@ impl Window {
             self.prompt = Some(prompt);
         } else if let Some(active_drag) = cx.active_drag.take() {
             let mut element = active_drag.view.clone().into_any_element();
-            let offset = self.mouse_position() - active_drag.cursor_offset;
+            let offset = self.mouse_position_untracked() - active_drag.cursor_offset;
             element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
             active_drag_element = Some(element);
             cx.active_drag = Some(active_drag);
@@ -5822,7 +5863,7 @@ impl Window {
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
-        let hit_test = self.rendered_frame.hit_test(self.mouse_position());
+        let hit_test = self.rendered_frame.hit_test(self.mouse_position_untracked());
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;
             self.reset_cursor_style(cx);
@@ -9342,86 +9383,5 @@ mod inspector_tests {
             }
         })
         .expect("closed inspector has no bookkeeping and no style overrides");
-    }
-}
-
-#[cfg(test)]
-mod replay_effect_tests {
-    use std::{cell::Cell, rc::Rc};
-
-    use crate::{
-        AppContext as _, Context, Entity, IntoElement, Render, StyleRefinement, Styled,
-        TestAppContext, Window, canvas, px,
-    };
-
-    struct EffectTestRoot {
-        child: Entity<EffectTestView>,
-    }
-
-    impl Render for EffectTestRoot {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            self.child
-                .clone()
-                .cached(StyleRefinement::default().size(px(100.)))
-        }
-    }
-
-    struct EffectTestView {
-        effect_runs: Rc<Cell<usize>>,
-        prepaints: Rc<Cell<usize>>,
-    }
-
-    impl Render for EffectTestView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let effect_runs = self.effect_runs.clone();
-            let prepaints = self.prepaints.clone();
-            canvas(
-                move |_, window, cx| {
-                    prepaints.set(prepaints.get() + 1);
-                    let effect_runs = effect_runs.clone();
-                    window.replayable_effect(cx, move |_, _| effect_runs.set(effect_runs.get() + 1));
-                },
-                |_, _, _, _| {},
-            )
-            .size_full()
-        }
-    }
-
-    /// State published from prepaint through `replayable_effect` must reach every frame, including
-    /// the ones where a cached view is reused instead of prepainted.
-    #[gpui::test]
-    fn replayable_effects_run_when_a_cached_view_is_reused(cx: &mut TestAppContext) {
-        let effect_runs = Rc::new(Cell::new(0));
-        let prepaints = Rc::new(Cell::new(0));
-        let window = cx.add_window({
-            let (effect_runs, prepaints) = (effect_runs.clone(), prepaints.clone());
-            move |_, cx| EffectTestRoot {
-                child: cx.new(|_| EffectTestView { effect_runs, prepaints }),
-            }
-        });
-        let draw = |cx: &mut TestAppContext| {
-            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
-                .unwrap();
-        };
-
-        // Creating the window already drew once (a real prepaint).
-        assert_eq!((effect_runs.get(), prepaints.get()), (1, 1));
-
-        draw(cx);
-        draw(cx);
-        assert_eq!(prepaints.get(), 1, "the view is reused, not prepainted again");
-        assert_eq!(effect_runs.get(), 3, "yet its effect still runs on every frame");
-
-        let child = window
-            .read_with(cx, |root, _| root.child.clone())
-            .expect("read root");
-        child.update(cx, |_, cx| cx.notify());
-        draw(cx);
-        assert!(prepaints.get() > 1, "a notified view is prepainted again");
-
-        let (effects, prepaints_before) = (effect_runs.get(), prepaints.get());
-        draw(cx);
-        assert_eq!(prepaints.get(), prepaints_before, "and is reused afterwards");
-        assert_eq!(effect_runs.get(), effects + 1, "with its effect still running");
     }
 }

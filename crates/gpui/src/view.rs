@@ -4,9 +4,9 @@ use crate::{
     LayoutId, PaintIndex, Pixels, PrepaintStateIndex, Render, RenderOnce, Size, Style,
     StyleRefinement, TextStyle, WeakEntity,
 };
-use crate::{Empty, Window};
+use crate::{Empty, INPUT_MODIFIERS, INPUT_MOUSE, Modifiers, Point, Window};
 use anyhow::Result;
-use collections::FxHashSet;
+use collections::{FxHashSet, TypeIdHashSet};
 use refineable::Refineable;
 use std::mem;
 use std::{
@@ -297,6 +297,114 @@ struct ViewElementState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    deps: ViewDeps,
+}
+
+/// What a cached view's rendered output depends on besides its own notifications, so that it is
+/// only reused while none of it has changed.
+struct ViewDeps {
+    /// Every entity read while rendering, with the [`App::notify`] version it had at the time.
+    entities: Vec<(EntityId, u64)>,
+    /// Every global read while rendering, with its version.
+    globals: Vec<(TypeId, u64)>,
+    /// The same globals as a set, to re-record into an enclosing view on reuse.
+    global_types: TypeIdHashSet,
+    /// The mouse position and modifiers the view saw while rendering or painting, if it read them.
+    /// Nothing notifies a view when they change, so it's only reused while they're unchanged.
+    mouse: Option<Point<Pixels>>,
+    modifiers: Option<Modifiers>,
+}
+
+impl ViewDeps {
+    fn capture(
+        cx: &App,
+        window: &Window,
+        entities: &FxHashSet<EntityId>,
+        globals: TypeIdHashSet,
+        inputs: u8,
+    ) -> Self {
+        let mut deps = Self {
+            entities: entities.iter().map(|e| (*e, cx.notify_version(*e))).collect(),
+            globals: globals.iter().map(|g| (*g, cx.global_version(*g))).collect(),
+            global_types: globals,
+            mouse: None,
+            modifiers: None,
+        };
+        deps.capture_inputs(window, inputs);
+        deps
+    }
+
+    /// Remembers the current value of every input in `inputs` (a bitset of `INPUT_*`).
+    fn capture_inputs(&mut self, window: &Window, inputs: u8) {
+        if inputs & INPUT_MOUSE != 0 {
+            self.mouse = Some(window.mouse_position_untracked());
+        }
+        if inputs & INPUT_MODIFIERS != 0 {
+            self.modifiers = Some(window.modifiers_untracked());
+        }
+    }
+
+    fn inputs(&self) -> u8 {
+        (self.mouse.is_some() as u8 * INPUT_MOUSE) | (self.modifiers.is_some() as u8 * INPUT_MODIFIERS)
+    }
+
+    fn inputs_changed(&self, window: &Window) -> bool {
+        self.mouse.is_some_and(|m| m != window.mouse_position_untracked())
+            || self.modifiers.is_some_and(|m| m != window.modifiers_untracked())
+    }
+
+    fn entities_changed(&self, cx: &App) -> bool {
+        self.entities.iter().any(|(e, v)| cx.notify_version(*e) != *v)
+    }
+
+    fn globals_changed(&self, cx: &App) -> bool {
+        self.globals.iter().any(|(g, v)| cx.global_version(*g) != *v)
+    }
+}
+
+/// Why a cached view was (or wasn't) reused this frame. See [`take_view_cache_stats`].
+#[derive(Clone, Copy)]
+enum CacheOutcome {
+    Hit,
+    First,
+    Bounds,
+    Mask,
+    TextStyle,
+    Dirty,
+    Refreshing,
+    EntityDep,
+    GlobalDep,
+    Input,
+}
+
+const CACHE_OUTCOMES: [&str; 10] = [
+    "hit",
+    "first",
+    "bounds",
+    "mask",
+    "text_style",
+    "dirty",
+    "refreshing",
+    "entity_dep",
+    "global_dep",
+    "input",
+];
+
+static CACHE_STATS: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+fn record_outcome(outcome: CacheOutcome) {
+    CACHE_STATS[outcome as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Returns and resets how often cached views were reused, and why they weren't otherwise, as
+/// `(reason, count)` pairs. For performance investigation.
+pub fn take_view_cache_stats() -> Vec<(&'static str, u64)> {
+    CACHE_OUTCOMES
+        .iter()
+        .zip(&CACHE_STATS)
+        .map(|(name, count)| (*name, count.swap(0, std::sync::atomic::Ordering::Relaxed)))
+        .collect()
 }
 
 struct ViewElementCacheKey {
@@ -481,17 +589,30 @@ fn prepaint_view(
                 let content_mask = window.content_mask();
                 let text_style = window.text_style();
 
-                if let Some(mut element_state) = element_state
-                    && element_state.cache_key.bounds == bounds
-                    && element_state.cache_key.content_mask == content_mask
-                    && element_state.cache_key.text_style == text_style
-                    && !window.dirty_views.contains(&entity_id)
-                    && !window.refreshing
-                {
+                let outcome = match &element_state {
+                    None => CacheOutcome::First,
+                    Some(state) if state.cache_key.bounds != bounds => CacheOutcome::Bounds,
+                    Some(state) if state.cache_key.content_mask != content_mask => CacheOutcome::Mask,
+                    Some(state) if state.cache_key.text_style != text_style => {
+                        CacheOutcome::TextStyle
+                    }
+                    Some(_) if window.dirty_views.contains(&entity_id) => CacheOutcome::Dirty,
+                    Some(_) if window.refreshing => CacheOutcome::Refreshing,
+                    Some(state) if state.deps.inputs_changed(window) => CacheOutcome::Input,
+                    Some(state) if state.deps.entities_changed(cx) => CacheOutcome::EntityDep,
+                    Some(state) if state.deps.globals_changed(cx) => CacheOutcome::GlobalDep,
+                    Some(_) => CacheOutcome::Hit,
+                };
+                record_outcome(outcome);
+
+                if let (CacheOutcome::Hit, Some(mut element_state)) = (outcome, element_state) {
                     let prepaint_start = window.prepaint_index();
                     window.reuse_prepaint(element_state.prepaint_range.clone(), cx);
                     cx.entities
                         .extend_accessed(&element_state.accessed_entities);
+                    cx.extend_accessed_globals(&element_state.deps.global_types);
+                    // Enclosing views must stay tied to the inputs this one is tied to.
+                    window.input_reads.set(window.input_reads.get() | element_state.deps.inputs());
                     let prepaint_end = window.prepaint_index();
                     element_state.prepaint_range = prepaint_start..prepaint_end;
 
@@ -500,7 +621,8 @@ fn prepaint_view(
 
                 let refreshing = mem::replace(&mut window.refreshing, true);
                 let prepaint_start = window.prepaint_index();
-                let (element, accessed_entities) = cx.detect_accessed_entities(|cx| {
+                let outer_input_reads = window.input_reads.replace(0);
+                let (element, accessed_entities, accessed_globals) = cx.detect_accessed(|cx| {
                     let mut element = render(window, cx);
                     // The view's box was already sized by its parent (from the cached style),
                     // so a root that relied on the parent for its size (`flex_1`, stretch)
@@ -514,10 +636,14 @@ fn prepaint_view(
 
                 let prepaint_end = window.prepaint_index();
                 window.refreshing = refreshing;
+                let inputs = window.input_reads.get();
+                window.input_reads.set(outer_input_reads | inputs);
+                let deps = ViewDeps::capture(cx, window, &accessed_entities, accessed_globals, inputs);
 
                 (
                     Some(element),
                     ViewElementState {
+                        deps,
                         accessed_entities,
                         prepaint_range: prepaint_start..prepaint_end,
                         paint_range: PaintIndex::default()..PaintIndex::default(),
@@ -567,7 +693,11 @@ fn paint_view(
 
                     if let Some(element) = element {
                         let refreshing = mem::replace(&mut window.refreshing, true);
+                        let outer_input_reads = window.input_reads.replace(0);
                         element.paint(window, cx);
+                        let inputs = window.input_reads.get();
+                        window.input_reads.set(outer_input_reads | inputs);
+                        element_state.deps.capture_inputs(window, inputs);
                         window.refreshing = refreshing;
                     } else {
                         window.reuse_paint(element_state.paint_range.clone());

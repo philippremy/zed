@@ -1,0 +1,235 @@
+//! Cached views (`AnyView::cached`) must behave like uncached ones: they may skip work only when
+//! nothing they depend on has changed.
+
+use std::{cell::Cell, rc::Rc};
+
+use gpui::{
+    AppContext as _, Context, Entity, Global, IntoElement, Modifiers, MouseMoveEvent,
+    PlatformInput, Render, StyleRefinement, Styled, TestAppContext, WindowHandle, canvas, div,
+    point, px,
+};
+
+/// A root that shows one cached child.
+struct Root<V: Render> {
+    child: Entity<V>,
+}
+
+impl<V: Render> Render for Root<V> {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.child
+            .clone()
+            .cached(StyleRefinement::default().size(px(100.)))
+    }
+}
+
+fn draw<V: Render>(window: WindowHandle<Root<V>>, cx: &mut TestAppContext) {
+    cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+        .unwrap();
+}
+
+// --- replayable effects --------------------------------------------------------------------
+
+struct EffectView {
+    effect_runs: Rc<Cell<usize>>,
+    prepaints: Rc<Cell<usize>>,
+}
+
+impl Render for EffectView {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+        let effect_runs = self.effect_runs.clone();
+        let prepaints = self.prepaints.clone();
+        canvas(
+            move |_, window, cx| {
+                prepaints.set(prepaints.get() + 1);
+                let effect_runs = effect_runs.clone();
+                window.replayable_effect(cx, move |_, _| effect_runs.set(effect_runs.get() + 1));
+            },
+            |_, _, _, _| {},
+        )
+        .size_full()
+    }
+}
+
+/// State published from prepaint through `replayable_effect` must reach every frame, including
+/// the ones where a cached view is reused instead of prepainted.
+#[gpui::test]
+fn replayable_effects_run_when_a_cached_view_is_reused(cx: &mut TestAppContext) {
+    let effect_runs = Rc::new(Cell::new(0));
+    let prepaints = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let (effect_runs, prepaints) = (effect_runs.clone(), prepaints.clone());
+        move |_, cx| Root {
+            child: cx.new(|_| EffectView { effect_runs, prepaints }),
+        }
+    });
+
+    // Creating the window already drew once (a real prepaint).
+    assert_eq!((effect_runs.get(), prepaints.get()), (1, 1));
+
+    draw(window, cx);
+    draw(window, cx);
+    assert_eq!(prepaints.get(), 1, "the view is reused, not prepainted again");
+    assert_eq!(effect_runs.get(), 3, "yet its effect still runs on every frame");
+
+    let child = window
+        .read_with(cx, |root, _| root.child.clone())
+        .expect("read root");
+    child.update(cx, |_, cx| cx.notify());
+    draw(window, cx);
+    assert!(prepaints.get() > 1, "a notified view is prepainted again");
+
+    let (effects, prepaints_before) = (effect_runs.get(), prepaints.get());
+    draw(window, cx);
+    assert_eq!(prepaints.get(), prepaints_before, "and is reused afterwards");
+    assert_eq!(effect_runs.get(), effects + 1, "with its effect still running");
+}
+
+// --- dependencies read but not observed ----------------------------------------------------
+
+struct Source {
+    value: u32,
+}
+
+struct Reader {
+    source: Entity<Source>,
+    renders: Rc<Cell<usize>>,
+    seen: Rc<Cell<u32>>,
+}
+
+impl Render for Reader {
+    fn render(&mut self, _: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        self.seen.set(self.source.read(cx).value);
+        div()
+    }
+}
+
+/// A cached view that reads another entity without ever observing it must still re-render when
+/// that entity changes; it does with an uncached view, so caching may not change it.
+#[gpui::test]
+fn cached_view_rerenders_when_an_entity_it_read_is_notified(cx: &mut TestAppContext) {
+    let renders = Rc::new(Cell::new(0));
+    let seen = Rc::new(Cell::new(0));
+    let source = cx.new(|_| Source { value: 1 });
+    let window = cx.add_window({
+        let (source, renders, seen) = (source.clone(), renders.clone(), seen.clone());
+        move |_, cx| Root {
+            child: cx.new(|_| Reader { source, renders, seen }),
+        }
+    });
+    assert_eq!((renders.get(), seen.get()), (1, 1));
+
+    draw(window, cx);
+    draw(window, cx);
+    assert_eq!(renders.get(), 1, "nothing changed, so the view is reused");
+
+    source.update(cx, |source, cx| {
+        source.value = 2;
+        cx.notify();
+    });
+    draw(window, cx);
+    assert_eq!(seen.get(), 2, "the view shows the new value");
+
+    let renders_now = renders.get();
+    draw(window, cx);
+    assert_eq!(renders.get(), renders_now, "and is reused again afterwards");
+}
+
+// --- globals -------------------------------------------------------------------------------
+
+struct Theme(u32);
+impl Global for Theme {}
+
+struct GlobalReader {
+    renders: Rc<Cell<usize>>,
+    seen: Rc<Cell<u32>>,
+}
+
+impl Render for GlobalReader {
+    fn render(&mut self, _: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        self.seen.set(cx.global::<Theme>().0);
+        div()
+    }
+}
+
+/// Changing a global must reach cached views that read it, without a `refresh()`.
+#[gpui::test]
+fn cached_view_rerenders_when_a_global_it_read_changes(cx: &mut TestAppContext) {
+    cx.set_global(Theme(1));
+    let renders = Rc::new(Cell::new(0));
+    let seen = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let (renders, seen) = (renders.clone(), seen.clone());
+        move |_, cx| Root {
+            child: cx.new(|_| GlobalReader { renders, seen }),
+        }
+    });
+    assert_eq!((renders.get(), seen.get()), (1, 1));
+
+    draw(window, cx);
+    assert_eq!(renders.get(), 1, "nothing changed, so the view is reused");
+
+    cx.update(|cx| cx.set_global(Theme(2)));
+    draw(window, cx);
+    assert_eq!(seen.get(), 2, "the view shows the new global");
+
+    let renders_now = renders.get();
+    draw(window, cx);
+    assert_eq!(renders.get(), renders_now, "and is reused again afterwards");
+}
+
+// --- continuously changing input -----------------------------------------------------------
+
+struct MouseReader {
+    prepaints: Rc<Cell<usize>>,
+}
+
+impl Render for MouseReader {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+        let prepaints = self.prepaints.clone();
+        canvas(
+            move |_, window, _| {
+                prepaints.set(prepaints.get() + 1);
+                let _ = window.mouse_position();
+            },
+            |_, _, _, _| {},
+        )
+        .size_full()
+    }
+}
+
+/// Nothing notifies a view when the mouse moves, so a view that read the mouse position while
+/// drawing is only reused while the position it saw is unchanged.
+#[gpui::test]
+fn cached_view_that_reads_the_mouse_follows_it(cx: &mut TestAppContext) {
+    let prepaints = Rc::new(Cell::new(0));
+    let window = cx.add_window({
+        let prepaints = prepaints.clone();
+        move |_, cx| Root {
+            child: cx.new(|_| MouseReader { prepaints }),
+        }
+    });
+    draw(window, cx);
+    draw(window, cx);
+    assert_eq!(prepaints.get(), 1, "the mouse is still, so the view is reused");
+
+    window
+        .update(cx, |_, window, cx| {
+            window.dispatch_event(
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position: point(px(5.), px(7.)),
+                    pressed_button: None,
+                    modifiers: Modifiers::default(),
+                }),
+                cx,
+            )
+        })
+        .unwrap();
+    draw(window, cx);
+    assert!(prepaints.get() > 1, "the mouse moved, so the view is prepainted again");
+
+    let before = prepaints.get();
+    draw(window, cx);
+    assert_eq!(prepaints.get(), before, "and is reused while it stays put");
+}

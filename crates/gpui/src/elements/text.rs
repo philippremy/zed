@@ -1158,7 +1158,7 @@ impl Element for InteractiveText {
             |interactive_state, window| {
                 let mut interactive_state = interactive_state.unwrap_or_default();
                 if let Some(click_listener) = self.click_listener.take() {
-                    let mouse_position = window.mouse_position();
+                    let mouse_position = window.mouse_position_untracked();
                     if let Ok(ix) = text_layout.index_for_position(mouse_position)
                         && self
                             .clickable_ranges
@@ -1237,7 +1237,7 @@ impl Element for InteractiveText {
                         let text_layout = text_layout.clone();
                         move |window: &mut Window, cx: &mut App| {
                             text_layout
-                                .index_for_position(window.mouse_position())
+                                .index_for_position(window.mouse_position_untracked())
                                 .ok()
                                 .and_then(|position| tooltip_builder(position, window, cx))
                                 .map(|view| (view, tooltip_is_hoverable))
@@ -1251,9 +1251,9 @@ impl Element for InteractiveText {
                         let pending_mouse_down = interactive_state.mouse_down_index.clone();
                         move |window: &Window| {
                             text_layout
-                                .index_for_position(window.mouse_position())
+                                .index_for_position(window.mouse_position_untracked())
                                 .is_ok()
-                                && source_bounds.contains(&window.mouse_position())
+                                && source_bounds.contains(&window.mouse_position_untracked())
                                 && pending_mouse_down.get().is_none()
                         }
                     });
@@ -1264,7 +1264,7 @@ impl Element for InteractiveText {
                         let pending_mouse_down = interactive_state.mouse_down_index.clone();
                         move |window: &Window| {
                             text_layout
-                                .index_for_position(window.mouse_position())
+                                .index_for_position(window.mouse_position_untracked())
                                 .is_ok()
                                 && hitbox.is_hovered(window)
                                 && pending_mouse_down.get().is_none()

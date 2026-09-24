@@ -791,6 +791,15 @@ pub struct App {
     // the tokio runtime. As any task attempting to spawn a blocking tokio task,
     // might panic.
     pub(crate) globals_by_type: TypeIdHashMap<Box<dyn Any>>,
+    /// Bumped on every [`App::notify`] of an entity. A cached view records the version of every
+    /// entity it read while rendering and is only reused while they are all unchanged, so state
+    /// read from an entity the view never observed can't go stale under caching.
+    pub(crate) notify_versions: FxHashMap<EntityId, u64>,
+    /// Like `notify_versions`, for globals: bumped whenever a global is written.
+    pub(crate) global_versions: TypeIdHashMap<u64>,
+    /// Globals read since tracking began (only while `global_tracking_depth > 0`).
+    accessed_globals: RefCell<TypeIdHashSet>,
+    global_tracking_depth: Cell<u32>,
 
     // assets
     pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
@@ -884,6 +893,10 @@ impl App {
                 asset_source,
                 http_client,
                 globals_by_type: Default::default(),
+                notify_versions: FxHashMap::default(),
+                global_versions: Default::default(),
+                accessed_globals: RefCell::new(TypeIdHashSet::default()),
+                global_tracking_depth: Cell::new(0),
                 entities,
                 new_entity_observers: SubscriberSet::new(),
                 windows: SlotMap::with_key(),
@@ -1191,12 +1204,18 @@ impl App {
         })
     }
 
-    pub(crate) fn detect_accessed_entities<R>(
+    /// Runs `callback`, returning the entities it read and the globals it read.
+    pub(crate) fn detect_accessed<R>(
         &mut self,
         callback: impl FnOnce(&mut App) -> R,
-    ) -> (R, FxHashSet<EntityId>) {
+    ) -> (R, FxHashSet<EntityId>, TypeIdHashSet) {
         let accessed_entities_start = self.entities.accessed_entities.get_mut().clone();
+        let accessed_globals_start = self.accessed_globals.get_mut().clone();
+        self.global_tracking_depth
+            .set(self.global_tracking_depth.get() + 1);
         let result = callback(self);
+        self.global_tracking_depth
+            .set(self.global_tracking_depth.get() - 1);
         let entities_accessed_in_callback = self
             .entities
             .accessed_entities
@@ -1204,7 +1223,39 @@ impl App {
             .difference(&accessed_entities_start)
             .copied()
             .collect::<FxHashSet<EntityId>>();
-        (result, entities_accessed_in_callback)
+        let globals_accessed_in_callback = self
+            .accessed_globals
+            .get_mut()
+            .difference(&accessed_globals_start)
+            .copied()
+            .collect::<TypeIdHashSet>();
+        (
+            result,
+            entities_accessed_in_callback,
+            globals_accessed_in_callback,
+        )
+    }
+
+    fn note_global_read(&self, global_type: TypeId) {
+        if self.global_tracking_depth.get() > 0 {
+            self.accessed_globals.borrow_mut().insert(global_type);
+        }
+    }
+
+    /// Re-records globals a reused cached view depends on, so an enclosing view's own
+    /// dependency set still covers everything nested inside it.
+    pub(crate) fn extend_accessed_globals(&mut self, globals: &TypeIdHashSet) {
+        if self.global_tracking_depth.get() > 0 {
+            self.accessed_globals.get_mut().extend(globals.iter().copied());
+        }
+    }
+
+    pub(crate) fn notify_version(&self, entity_id: EntityId) -> u64 {
+        self.notify_versions.get(&entity_id).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn global_version(&self, global_type: TypeId) -> u64 {
+        self.global_versions.get(&global_type).copied().unwrap_or(0)
     }
 
     pub(crate) fn record_entities_accessed(
@@ -1765,6 +1816,7 @@ impl App {
                 }
             }
             Effect::NotifyGlobalObservers { global_type } => {
+                *self.global_versions.entry(*global_type).or_insert(0) += 1;
                 if !self.pending_global_notifications.insert(*global_type) {
                     return;
                 }
@@ -1862,6 +1914,7 @@ impl App {
                 self.event_listeners.remove(&entity_id);
                 self.window_invalidators_by_entity.remove(&entity_id);
                 self.current_window_by_entity.remove(&entity_id);
+                self.notify_versions.remove(&entity_id);
                 for release_callback in self.release_listeners.remove(&entity_id) {
                     release_callback(entity.as_mut(), self);
                 }
@@ -2118,12 +2171,14 @@ impl App {
 
     /// Check whether a global of the given type has been assigned.
     pub fn has_global<G: Global>(&self) -> bool {
+        self.note_global_read(TypeId::of::<G>());
         self.globals_by_type.contains_key(&TypeId::of::<G>())
     }
 
     /// Access the global of the given type. Panics if a global for that type has not been assigned.
     #[track_caller]
     pub fn global<G: Global>(&self) -> &G {
+        self.note_global_read(TypeId::of::<G>());
         self.globals_by_type
             .get(&TypeId::of::<G>())
             .map(|any_state| any_state.downcast_ref::<G>().unwrap())
@@ -2132,6 +2187,7 @@ impl App {
 
     /// Access the global of the given type if a value has been assigned.
     pub fn try_global<G: Global>(&self) -> Option<&G> {
+        self.note_global_read(TypeId::of::<G>());
         self.globals_by_type
             .get(&TypeId::of::<G>())
             .map(|any_state| any_state.downcast_ref::<G>().unwrap())
@@ -2788,6 +2844,7 @@ impl App {
 
     /// Tell GPUI that an entity has changed and observers of it should be notified.
     pub fn notify(&mut self, entity_id: EntityId) {
+        *self.notify_versions.entry(entity_id).or_insert(0) += 1;
         let window_invalidators = mem::take(
             self.window_invalidators_by_entity
                 .entry(entity_id)

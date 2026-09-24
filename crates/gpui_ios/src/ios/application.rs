@@ -1,4 +1,4 @@
-use super::window::IosWindowState;
+use super::{menu, window::IosWindowState};
 use gpui::{AppLifecyclePhase, WindowVisibility};
 use objc2::{
     ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, extern_class,
@@ -11,8 +11,9 @@ use objc2_foundation::{
     NSDictionary, NSObject, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSSet, NSString,
 };
 use objc2_quartz_core::CADisplayLink;
+use objc2::runtime::{ProtocolObject, Sel};
 use objc2_ui_kit::{
-    UIApplication, UIApplicationDelegate, UIApplicationLaunchOptionsKey, UIOpenURLContext, UIScene,
+    UICommand, UIMenuBuilder, UIMenuSystem, UIResponder, UIApplication, UIApplicationDelegate, UIApplicationLaunchOptionsKey, UIOpenURLContext, UIScene,
     UISceneConfiguration, UISceneConnectionOptions, UISceneDelegate, UISceneSession, UIWindowScene,
     UIWindowSceneDelegate,
 };
@@ -176,10 +177,39 @@ impl SceneConnectionOptions {
 }
 
 define_class!(
-    #[unsafe(super = NSObject)]
+    // A `UIResponder`, so UIKit asks it to build the main menu and routes menu commands to it.
+    #[unsafe(super = UIResponder)]
     #[thread_kind = MainThreadOnly]
     #[name = "GPUIIosAppDelegate"]
     struct AppDelegate;
+
+    impl AppDelegate {
+        #[unsafe(method(buildMenuWithBuilder:))]
+        fn build_menu(&self, builder: &ProtocolObject<dyn UIMenuBuilder>) {
+            let _: () = unsafe { msg_send![super(self), buildMenuWithBuilder: builder] };
+            // Only the main menu is ours to shape (not context menus).
+            if builder.system() == UIMenuSystem::mainSystem(self.mtm()) {
+                menu::build(builder, self.mtm());
+            }
+        }
+
+        #[unsafe(method(handleGPUIMenuItem:))]
+        fn handle_menu_item(&self, sender: Option<&AnyObject>) {
+            menu::perform(sender);
+        }
+
+        #[unsafe(method(validateCommand:))]
+        fn validate_command(&self, command: &UICommand) {
+            menu::validate(command);
+            let _: () = unsafe { msg_send![super(self), validateCommand: command] };
+        }
+
+        #[unsafe(method(canPerformAction:withSender:))]
+        fn can_perform_action(&self, action: Sel, sender: Option<&AnyObject>) -> bool {
+            action == menu::item_selector()
+                || unsafe { msg_send![super(self), canPerformAction: action, withSender: sender] }
+        }
+    }
 
     unsafe impl NSObjectProtocol for AppDelegate {}
 

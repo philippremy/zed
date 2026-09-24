@@ -3,7 +3,7 @@
 //! This implements the Platform trait for iOS using UIKit.
 //! Key differences from macOS:
 //! - Uses UIApplication instead of NSApplication
-//! - No menu bar (iOS apps don't have traditional menus)
+//! - The main menu (iPadOS menu bar) is built with `UIMenuBuilder`, see `menu.rs`
 //! - No windowed mode (iOS apps are always fullscreen on their display)
 //! - Touch-based input instead of mouse
 //! - System keyboard handling differs significantly
@@ -313,25 +313,28 @@ impl Platform for IosPlatform {
         super::application::set_memory_warning_callback(callback);
     }
 
-    fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {
-        // iOS doesn't have a menu bar
-        // Could potentially integrate with UIMenuBuilder for context menus
+    fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap) {
+        super::menu::set_menus(menus, keymap);
+    }
+
+    fn get_menus(&self) -> Option<Vec<gpui::OwnedMenu>> {
+        super::menu::owned_menus()
     }
 
     fn set_dock_menu(&self, _menu: Vec<MenuItem>, _keymap: &Keymap) {
         // iOS doesn't have a dock menu
     }
 
-    fn on_app_menu_action(&self, _callback: Box<dyn FnMut(&dyn Action)>) {
-        // Not applicable on iOS
+    fn on_app_menu_action(&self, callback: Box<dyn FnMut(&dyn Action)>) {
+        super::menu::set_menu_command_callback(callback);
     }
 
-    fn on_will_open_app_menu(&self, _callback: Box<dyn FnMut()>) {
-        // Not applicable on iOS
+    fn on_will_open_app_menu(&self, callback: Box<dyn FnMut()>) {
+        super::menu::set_will_open_callback(callback);
     }
 
-    fn on_validate_app_menu_command(&self, _callback: Box<dyn FnMut(&dyn Action) -> bool>) {
-        // Not applicable on iOS
+    fn on_validate_app_menu_command(&self, callback: Box<dyn FnMut(&dyn Action) -> bool>) {
+        super::menu::set_validate_callback(callback);
     }
 
     fn app_path(&self) -> Result<PathBuf> {

@@ -5096,6 +5096,17 @@ impl Window {
             .request_measured_layout_keyed(style, rem_size, scale_factor, Some(content_key), measure)
     }
 
+    /// Makes any `auto` dimension of the root node `layout_id` fill `size`, the way window roots
+    /// fill the viewport. Used for cached views, whose rendered element is laid out as a
+    /// standalone root and would otherwise lose the size its parent gave it (`flex_1`, stretch).
+    pub(crate) fn stretch_root_to_fill(&mut self, layout_id: LayoutId, size: Size<Pixels>) {
+        let scale_factor = self.scale_factor();
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .stretch_auto_size_to_fill(layout_id, size, scale_factor);
+    }
+
     /// Compute the layout for the given id within the given available space.
     /// This method is called for its side effect, typically by the framework prior to painting.
     /// After calling it, you can request the bounds of the given layout node id or any descendant.

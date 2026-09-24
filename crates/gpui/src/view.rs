@@ -489,7 +489,7 @@ fn prepaint_view(
                     && !window.refreshing
                 {
                     let prepaint_start = window.prepaint_index();
-                    window.reuse_prepaint(element_state.prepaint_range.clone());
+                    window.reuse_prepaint(element_state.prepaint_range.clone(), cx);
                     cx.entities
                         .extend_accessed(&element_state.accessed_entities);
                     let prepaint_end = window.prepaint_index();

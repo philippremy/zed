@@ -975,6 +975,10 @@ pub(crate) struct DeferredDraw {
     paint_range: Range<PaintIndex>,
 }
 
+/// A prepaint side effect that must run again whenever the view that recorded it is reused from
+/// the previous frame instead of being re-prepainted. See [`Window::replayable_effect`].
+pub(crate) type ReplayEffect = Rc<dyn Fn(&mut Window, &mut App)>;
+
 pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
@@ -989,6 +993,7 @@ pub(crate) struct Frame {
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
+    replay_effects: Vec<ReplayEffect>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -1007,6 +1012,7 @@ pub(crate) struct PrepaintStateIndex {
     deferred_draws_index: usize,
     dispatch_tree_index: usize,
     accessed_element_states_index: usize,
+    effects_index: usize,
     line_layout_index: LineLayoutIndex,
 }
 
@@ -1045,6 +1051,7 @@ impl Frame {
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
+            replay_effects: Vec::new(),
 
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
@@ -1069,6 +1076,7 @@ impl Frame {
         self.input_handlers.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
+        self.replay_effects.clear();
         self.hitboxes.clear();
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
@@ -3749,7 +3757,7 @@ impl Window {
                     });
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
                 } else {
-                    self.reuse_prepaint(prepaint_range);
+                    self.reuse_prepaint(prepaint_range, cx);
                 }
                 let prepaint_end = self.prepaint_index();
                 self.next_frame.deferred_draws[deferred_draw_ix].prepaint_range =
@@ -3815,11 +3823,30 @@ impl Window {
             deferred_draws_index: self.next_frame.deferred_draws.len(),
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
+            effects_index: self.next_frame.replay_effects.len(),
             line_layout_index: self.text_system.layout_index(),
         }
     }
 
-    pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+    /// Runs `effect` now, and again every frame this element's view is reused from the previous
+    /// frame (see [`crate::AnyView::cached`]) rather than prepainted afresh.
+    ///
+    /// A cached view that hasn't been notified skips its prepaint entirely, so any state an
+    /// element publishes to a per-frame registry *during prepaint* (as opposed to state kept in an
+    /// entity or other cross-frame storage) would silently vanish from that frame. Publish it
+    /// through this instead, with an `effect` that is a pure function of what it captured: the
+    /// view is only reused when its bounds, content mask and text style are unchanged, and it is
+    /// re-prepainted whenever it is invalidated.
+    ///
+    /// This method should only be called as part of the prepaint phase of element drawing.
+    pub fn replayable_effect(&mut self, cx: &mut App, effect: impl Fn(&mut Window, &mut App) + 'static) {
+        self.invalidator.debug_assert_prepaint();
+        let effect: ReplayEffect = Rc::new(effect);
+        self.next_frame.replay_effects.push(effect.clone());
+        effect(self, cx);
+    }
+
+    pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>, cx: &mut App) {
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
@@ -3848,6 +3875,16 @@ impl Window {
 
         if reused_subtree.contains_focus() {
             self.next_frame.focus = self.focus;
+        }
+
+        let effects: SmallVec<[ReplayEffect; 4]> = self.rendered_frame.replay_effects
+            [range.start.effects_index..range.end.effects_index]
+            .iter()
+            .cloned()
+            .collect();
+        for effect in effects {
+            self.next_frame.replay_effects.push(effect.clone());
+            effect(self, cx);
         }
 
         self.next_frame.deferred_draws.extend(
@@ -9305,5 +9342,86 @@ mod inspector_tests {
             }
         })
         .expect("closed inspector has no bookkeeping and no style overrides");
+    }
+}
+
+#[cfg(test)]
+mod replay_effect_tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use crate::{
+        AppContext as _, Context, Entity, IntoElement, Render, StyleRefinement, Styled,
+        TestAppContext, Window, canvas, px,
+    };
+
+    struct EffectTestRoot {
+        child: Entity<EffectTestView>,
+    }
+
+    impl Render for EffectTestRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.child
+                .clone()
+                .cached(StyleRefinement::default().size(px(100.)))
+        }
+    }
+
+    struct EffectTestView {
+        effect_runs: Rc<Cell<usize>>,
+        prepaints: Rc<Cell<usize>>,
+    }
+
+    impl Render for EffectTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let effect_runs = self.effect_runs.clone();
+            let prepaints = self.prepaints.clone();
+            canvas(
+                move |_, window, cx| {
+                    prepaints.set(prepaints.get() + 1);
+                    let effect_runs = effect_runs.clone();
+                    window.replayable_effect(cx, move |_, _| effect_runs.set(effect_runs.get() + 1));
+                },
+                |_, _, _, _| {},
+            )
+            .size_full()
+        }
+    }
+
+    /// State published from prepaint through `replayable_effect` must reach every frame, including
+    /// the ones where a cached view is reused instead of prepainted.
+    #[gpui::test]
+    fn replayable_effects_run_when_a_cached_view_is_reused(cx: &mut TestAppContext) {
+        let effect_runs = Rc::new(Cell::new(0));
+        let prepaints = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let (effect_runs, prepaints) = (effect_runs.clone(), prepaints.clone());
+            move |_, cx| EffectTestRoot {
+                child: cx.new(|_| EffectTestView { effect_runs, prepaints }),
+            }
+        });
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+        };
+
+        // Creating the window already drew once (a real prepaint).
+        assert_eq!((effect_runs.get(), prepaints.get()), (1, 1));
+
+        draw(cx);
+        draw(cx);
+        assert_eq!(prepaints.get(), 1, "the view is reused, not prepainted again");
+        assert_eq!(effect_runs.get(), 3, "yet its effect still runs on every frame");
+
+        let child = window
+            .read_with(cx, |root, _| root.child.clone())
+            .expect("read root");
+        child.update(cx, |_, cx| cx.notify());
+        draw(cx);
+        assert!(prepaints.get() > 1, "a notified view is prepainted again");
+
+        let (effects, prepaints_before) = (effect_runs.get(), prepaints.get());
+        draw(cx);
+        assert_eq!(prepaints.get(), prepaints_before, "and is reused afterwards");
+        assert_eq!(effect_runs.get(), effects + 1, "with its effect still running");
     }
 }
